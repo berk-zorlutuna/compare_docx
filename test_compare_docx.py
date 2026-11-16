@@ -125,7 +125,9 @@ def test_textbox_text_not_duplicated(tmp_path):
 
 def test_identical(tmp_path):
     s, d, page = compare(tmp_path, paras("A", "B", "C"), paras("A", "B", "C"))
-    assert s == dict(same=3, changed=0, added=0, removed=0, img_same=0, img_added=0, img_removed=0)
+    expected = dict(same=3, changed=0, added=0, removed=0, img_same=0, img_added=0, img_removed=0)
+    assert {k: s[k] for k in expected} == expected
+    assert s["req_mode"] is False
     assert d is None
 
 
@@ -316,6 +318,161 @@ def test_large_document_speed(tmp_path):
     t = time.time()
     s, _, _ = compare(tmp_path, paras(*a), paras(*b))
     assert s["changed"] == 60 and s["same"] == 2940
+    assert time.time() - t < 30
+
+
+# ---------- requirements ----------
+
+def req_counts(s):
+    return (s["req_same"], s["req_changed"], s["req_added"], s["req_removed"], s["req_renumbered"])
+
+
+def cards(page):
+    """[(status, visible title text)] for each requirement card, in report order."""
+    out = []
+    for status, summary in re.findall(r'<details class="req req-(\w+)"[^>]*>\n<summary>(.*?)</summary>', page):
+        out.append((status, re.sub(r"<[^>]+>", "|", summary).strip("|")))
+    return out
+
+
+R1 = ["Requirement Number 1", "The system shall log every login attempt."]
+R2 = ["Requirement Number 2", "The system shall lock an account after five failed attempts."]
+R3 = ["Requirement Number 3", "Passwords shall be at least twelve characters long.", "This applies to all user roles."]
+
+
+def test_split_requirements_ids():
+    items = [{"text": t, "images": []} for t in [
+        "Document title",
+        "Requirement Number 5: The system shall work",
+        "Requirement Number: REQ-007", "Body",
+        "requirement number 3.2.1.", "Body",
+        "Requirement Number", "42", "Body in next cell",
+    ]]
+    secs = cd.split_requirements(items, "Requirement Number")
+    assert secs[0]["preamble"] and len(secs[0]["items"]) == 1
+    assert [s["id"] for s in secs[1:]] == ["5", "REQ-007", "3.2.1", "42"]
+    assert secs[1]["words"] == ["The", "system", "shall", "work"]
+
+
+def test_requirements_unchanged_changed_added_removed(tmp_path):
+    new2 = [R2[0], "The system shall lock an account after three failed attempts."]
+    r4 = ["Requirement Number 4", "Sessions shall expire after thirty minutes of inactivity."]
+    s, _, page = compare(tmp_path, paras("Intro", *R1, *R2, *R3), paras("Intro", *R1, *new2, *r4))
+    assert s["req_mode"] is True
+    assert req_counts(s) == (1, 1, 1, 1, 0), s
+    assert [c[0] for c in cards(page)] == ["same", "same", "changed", "removed", "added"]
+    assert '<span class="removed">five</span>' in page and '<span class="added">three</span>' in page
+    # unchanged requirements are collapsed, changed ones are open
+    assert re.search(r'req-same" id="req-1">', page) and re.search(r'req-changed" id="req-2" open>', page)
+    # index lists only what changed
+    assert page.count('<li><a href="#req-') == 3
+
+
+def test_requirement_inserted_in_middle_renumbers_rest(tmp_path):
+    """Inserting a requirement shifts later numbers; they must not all show as rewritten."""
+    new = ["Requirement Number 2", "All data shall be encrypted at rest using approved algorithms."]
+    shifted2 = ["Requirement Number 3"] + R2[1:]
+    shifted3 = ["Requirement Number 4"] + R3[1:]
+    s, _, page = compare(tmp_path, paras(*R1, *R2, *R3), paras(*R1, *new, *shifted2, *shifted3))
+    assert req_counts(s) == (1, 0, 1, 0, 2), s
+    c = cards(page)
+    assert [x[0] for x in c] == ["same", "added", "renumbered", "renumbered"]
+    assert "was Requirement Number 2" in c[2][1] and "content unchanged" in c[2][1]
+
+
+def test_renumbered_and_edited(tmp_path):
+    moved = ["Requirement Number 9", "Passwords shall be at least fourteen characters long.", R3[2]]
+    s, _, page = compare(tmp_path, paras(*R1, *R3), paras(*R1, *moved))
+    assert req_counts(s) == (1, 0, 0, 0, 1), s
+    assert "content also changed" in page
+
+
+def test_short_requirement_renumbered_and_edited(tmp_path):
+    old5 = ["Requirement Number 5", "Audit logs shall be retained for one year."]
+    old6 = ["Requirement Number 6", "The system shall support single sign-on via SAML."]
+    new6 = ["Requirement Number 6", "Audit logs shall be retained for two years."]
+    s, _, page = compare(tmp_path, paras(*R1, *old5, *old6), paras(*R1, *new6))
+    assert req_counts(s) == (1, 0, 0, 1, 1), s
+    assert "was Requirement Number 5" in page
+
+
+def test_same_number_heavily_rewritten_is_changed(tmp_path):
+    rewritten = ["Requirement Number 2", "Backups are taken nightly and stored offsite."]
+    s, _, _ = compare(tmp_path, paras(*R1, *R2), paras(*R1, *rewritten))
+    assert req_counts(s) == (1, 1, 0, 0, 0), s
+
+
+def test_requirements_reordered(tmp_path):
+    s, _, page = compare(tmp_path, paras(*R1, *R2, *R3), paras(*R3, *R1, *R2))
+    assert req_counts(s) == (3, 0, 0, 0, 0), s
+
+
+def test_requirement_text_in_heading_paragraph(tmp_path):
+    s, _, page = compare(
+        tmp_path,
+        paras("Requirement Number 1: The pump shall start within 2 seconds.",
+              "Requirement Number 2: The valve shall close on power loss."),
+        paras("Requirement Number 1: The pump shall start within 3 seconds.",
+              "Requirement Number 2: The valve shall close on power loss."))
+    assert req_counts(s) == (1, 1, 0, 0, 0), s
+
+
+def test_requirement_number_in_table_cells(tmp_path):
+    def build(text):
+        def b(doc):
+            for num, body in (("1", "Alpha shall beta."), ("2", text)):
+                t = doc.add_table(rows=2, cols=2)
+                t.cell(0, 0).text = "Requirement Number"; t.cell(0, 1).text = num
+                t.cell(1, 0).text = "Description"; t.cell(1, 1).text = body
+        return b
+    s, _, page = compare(tmp_path, build("Gamma shall delta."), build("Gamma shall epsilon."))
+    assert req_counts(s) == (1, 1, 0, 0, 0), s
+    assert [c[1] for c in cards(page)] == ["Unchanged|Requirement Number 1", "Changed|Requirement Number 2"]
+
+
+def test_requirement_image_change(tmp_path):
+    def build(color):
+        def b(doc):
+            paras(*R1)(doc)
+            doc.add_paragraph("Requirement Number 2")
+            with_img("See figure", color)(doc)
+        return b
+    s, _, _ = compare(tmp_path, build("red"), build("blue"))
+    assert req_counts(s) == (1, 1, 0, 0, 0), s
+
+
+def test_duplicate_requirement_numbers(tmp_path):
+    a = ["Requirement Number 1", "First text about logging events."]
+    b = ["Requirement Number 1", "Second text about archiving records."]
+    s, _, _ = compare(tmp_path, paras(*a, *b), paras(*a, *b))
+    assert req_counts(s) == (2, 0, 0, 0, 0), s
+
+
+def test_custom_and_empty_prefix(tmp_path):
+    f1 = make(tmp_path, "o.docx", paras("REQ-1", "Old text here", "REQ-2", "Stays"))
+    f2 = make(tmp_path, "n.docx", paras("REQ-1", "New text here", "REQ-2", "Stays"))
+    out = str(tmp_path / "r.html")
+    s, _ = cd.run_comparison(f1, f2, out, "REQ-")
+    assert req_counts(s) == (1, 1, 0, 0, 0), s
+    s, _ = cd.run_comparison(f1, f2, out, "")
+    assert s["req_mode"] is False and s["changed"] == 1
+    s, _ = cd.run_comparison(f1, f2, out)  # default prefix not present -> plain report
+    assert s["req_mode"] is False
+    assert "No paragraphs starting with" in open(out, encoding="utf-8").read()
+
+
+def test_many_requirements_speed(tmp_path):
+    import time
+    def reqs(n, edit=()):
+        out = []
+        for i in range(1, n + 1):
+            out += [f"Requirement Number {i}",
+                    f"The subsystem {i} shall satisfy constraint {i * 7} under condition {i * 13}"
+                    + (" revised" if i in edit else "")]
+        return out
+    t = time.time()
+    s, _, _ = compare(tmp_path, paras(*reqs(800)), paras(*reqs(800, edit={5, 400, 799})))
+    assert req_counts(s) == (797, 3, 0, 0, 0), s
     assert time.time() - t < 30
 
 

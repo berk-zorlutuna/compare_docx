@@ -19,6 +19,7 @@ import hashlib
 import html
 import os
 import pathlib
+import string
 import threading
 import webbrowser
 import zipfile
@@ -48,6 +49,11 @@ MC_FALLBACK = "{http://schemas.openxmlformats.org/markup-compatibility/2006}Fall
 # Two paragraphs are treated as "the same paragraph, edited" when at least
 # this share of their words match. Below it they count as removed + added.
 SIMILARITY_THRESHOLD = 0.5
+# A requirement whose number changed is still recognised as the same
+# requirement when at least this share of its content matches.
+RENUMBER_THRESHOLD = 0.6
+# Paragraphs starting with this text mark the beginning of a requirement.
+DEFAULT_REQUIREMENT_PREFIX = "Requirement Number"
 # Largest changed block (old paragraphs x new paragraphs) that gets the
 # careful similarity alignment; bigger blocks use a faster simple pairing.
 MAX_ALIGN_CELLS = 10000
@@ -318,8 +324,12 @@ def align_block(old_block, new_block):
     return pairs
 
 
-def build_report(items1, items2, name1, name2):
-    """Compare the two ordered item lists and return (html_string, summary_counts)."""
+def diff_items(items1, items2):
+    """
+    Compare two ordered lists of paragraph items.
+    Returns (rows, counts, img_counts) where rows is a list of
+    (kind, html) with kind one of same / changed / added / removed.
+    """
     texts1 = [it["text"] for it in items1]
     texts2 = [it["text"] for it in items2]
     matcher = difflib.SequenceMatcher(None, texts1, texts2, autojunk=False)
@@ -373,69 +383,370 @@ def build_report(items1, items2, name1, name2):
                 else:
                     add_pair(old_it, new_it)
 
-    body_rows = "\n".join(
-        f'<div class="row {kind}">{content}</div>' for kind, content in rows
-    )
+    return rows, counts, img_counts
 
-    summary = {
-        "same": counts["same"], "changed": counts["changed"],
-        "added": counts["added"], "removed": counts["removed"],
-        "img_same": img_counts["same"], "img_added": img_counts["added"],
-        "img_removed": img_counts["removed"],
-    }
 
-    page = f"""<!DOCTYPE html>
+def rows_html(rows):
+    return "\n".join(f'<div class="row {kind}">{content}</div>' for kind, content in rows)
+
+
+# ===========================================================================
+# Requirements: splitting a document into requirements and matching them
+# ===========================================================================
+
+def split_requirements(items, prefix):
+    """
+    Group a document's paragraphs into requirements. A requirement starts at
+    a paragraph whose text begins with `prefix` (e.g. "Requirement Number")
+    and runs until the next such paragraph.
+
+    Returns a list of sections:
+        {"id": "12" or None, "name": "Requirement Number 12",
+         "items": [...paragraphs...], "words": [...words used for matching...]}
+
+    Any text before the first requirement becomes a section with
+    "preamble": True.
+
+    The requirement's ID is the first word after the prefix
+    ("Requirement Number 12: ..." -> "12", "Requirement Number: REQ-7" ->
+    "REQ-7"). If the heading paragraph has nothing after the prefix (common
+    when the number sits in the next table cell), the next short paragraph
+    is used as the ID.
+    """
+    prefix = prefix.strip()
+    needle = prefix.lower()
+    sections = []
+    current = None
+
+    for idx, it in enumerate(items):
+        text = it["text"]
+        if needle and text.lower().startswith(needle):
+            rest = text[len(prefix):].strip(" \t\n:.#-–—")
+            words = rest.split()
+            req_id = words[0].rstrip(".:,;)-–—") if words else ""
+            body_words = words[1:]
+            if not req_id and idx + 1 < len(items):
+                nxt = items[idx + 1]["text"].strip()
+                if nxt and len(nxt) <= 40 and not nxt.lower().startswith(needle):
+                    req_id = nxt
+            current = {
+                "id": req_id or None,
+                "name": f"{prefix} {req_id}".strip(),
+                "items": [it],
+                "words": list(body_words),
+                "preamble": False,
+            }
+            sections.append(current)
+        else:
+            if current is None:
+                current = {"id": None, "name": "Text before the first requirement",
+                           "items": [], "words": [], "preamble": True}
+                sections.append(current)
+            current["items"].append(it)
+            current["words"].extend(text.split())
+        # Pictures count towards "is this the same requirement?" too.
+        current["words"].extend("image:" + img["hash"] for img in it["images"])
+
+    return sections
+
+
+def _section_similarity(a, b, matcher=None):
+    """How alike two requirements' contents are, from 0.0 to 1.0 (ignoring their numbers)."""
+    if a["words"] == b["words"]:
+        return 1.0
+    if not a["words"] or not b["words"]:
+        return 0.0
+    matcher = matcher or difflib.SequenceMatcher(None, autojunk=False)
+    matcher.set_seqs(a["words"], b["words"])
+    return matcher.ratio()
+
+
+def match_requirements(old_secs, new_secs):
+    """
+    Decide which old requirement corresponds to which new requirement.
+    Returns a list of entries in report order:
+        {"old": section_or_None, "new": section_or_None, "renumbered": bool}
+
+    Matching goes in passes, most trustworthy first:
+      1. Same number AND similar content  -> same requirement.
+      2. Different number but (nearly) identical content -> renumbered.
+         (This is what keeps the report readable when a requirement is
+         inserted in the middle and everything after it shifts by one.)
+      3. Same number, content heavily rewritten -> same requirement.
+      4. Whatever is left is new (only in the new file) or removed.
+    """
+    def keyed(secs):
+        seen = Counter()
+        out = {}
+        for sec in secs:
+            if sec["preamble"]:
+                key = ("preamble",)
+            else:
+                base = (sec["id"] or "").lower()
+                key = ("req", base, seen[base])  # 3rd part separates duplicate numbers
+                seen[base] += 1
+            out[key] = sec
+        return out
+
+    old_by_key, new_by_key = keyed(old_secs), keyed(new_secs)
+    partner_of_new = {}   # id(new section) -> (old section, renumbered?)
+    used_old = set()
+
+    def pair(old, new, renumbered):
+        partner_of_new[id(new)] = (old, renumbered)
+        used_old.add(id(old))
+
+    # Pass 1: same number, similar content.
+    for key, new in new_by_key.items():
+        old = old_by_key.get(key)
+        if old is not None and (key == ("preamble",) or
+                                _section_similarity(old, new) >= SIMILARITY_THRESHOLD):
+            pair(old, new, False)
+
+    # Pass 2: renumbered (content nearly identical under a different number).
+    free_old = [s for s in old_secs if id(s) not in used_old and s["words"]]
+    free_new = [s for s in new_secs if id(s) not in partner_of_new and s["words"]]
+    if len(free_old) * len(free_new) <= MAX_ALIGN_CELLS:
+        matcher = difflib.SequenceMatcher(None, autojunk=False)
+        for new in free_new:
+            best, best_score = None, RENUMBER_THRESHOLD
+            matcher.set_seq2(new["words"])
+            for old in free_old:
+                if id(old) in used_old:
+                    continue
+                matcher.set_seq1(old["words"])
+                if matcher.real_quick_ratio() < best_score or matcher.quick_ratio() < best_score:
+                    continue
+                score = matcher.ratio()
+                if score >= best_score:
+                    best, best_score = old, score
+                    if score == 1.0:
+                        break
+            if best is not None:
+                pair(best, new, True)
+
+    # Pass 3: same number, even though the content was heavily rewritten.
+    for key, new in new_by_key.items():
+        old = old_by_key.get(key)
+        if id(new) not in partner_of_new and old is not None and id(old) not in used_old:
+            pair(old, new, False)
+
+    # Report order: the new document's order, with removed requirements
+    # slotted in after whatever preceded them in the old document.
+    entries = []
+    entry_of_old = {}
+    for new in new_secs:
+        old, renumbered = partner_of_new.get(id(new), (None, False))
+        entry = {"old": old, "new": new, "renumbered": renumbered}
+        entries.append(entry)
+        if old is not None:
+            entry_of_old[id(old)] = entry
+
+    previous_entry = None
+    for old in old_secs:
+        if id(old) in entry_of_old:
+            previous_entry = entry_of_old[id(old)]
+            continue
+        entry = {"old": old, "new": None, "renumbered": False}
+        position = 0 if previous_entry is None else next(
+            i for i, e in enumerate(entries) if e is previous_entry) + 1
+        entries.insert(position, entry)
+        previous_entry = entry
+
+    return entries
+
+
+STATUS_LABELS = {
+    "same": "Unchanged", "changed": "Changed", "added": "New",
+    "removed": "Removed", "renumbered": "Renumbered",
+}
+
+PAGE_TEMPLATE = string.Template("""<!DOCTYPE html>
 <html>
 <head>
 <meta charset="utf-8">
 <title>Document comparison</title>
 <style>
-  body {{ font-family: Arial, sans-serif; max-width: 900px; margin: 40px auto;
-          line-height: 1.6; color: #000; }}
-  h1 {{ font-size: 20px; }}
-  .summary {{ background: #f5f5f5; padding: 12px 16px; border-radius: 6px;
-              margin-bottom: 24px; font-size: 14px; }}
-  .row {{ padding: 8px 10px; border-radius: 4px; margin: 6px 0; }}
-  .row.same {{ color: #000; }}
-  .row.changed {{ background: #fff9e6; }}
-  .row.added {{ background: #eaffea; }}
-  .row.removed {{ background: #ffecec; }}
-  .added {{ background: #c6f6c6; color: #14532d; padding: 1px 3px; border-radius: 3px; }}
-  .removed {{ background: #f8c6c6; color: #7f1d1d; text-decoration: line-through;
-              padding: 1px 3px; border-radius: 3px; }}
-  .legend span {{ margin-right: 16px; }}
-  .img-inline {{ display: inline-block; vertical-align: top; margin: 8px 8px 0 0;
-                 border: 1px solid #ddd; border-radius: 6px; padding: 6px;
-                 background: #fff; }}
-  .img-inline img {{ max-width: 260px; max-height: 260px; display: block; }}
-  .img-badge {{ font-size: 11px; font-weight: bold; margin-bottom: 4px; }}
-  .img-same {{ border-color: #ddd; }}
-  .img-added {{ border-color: #4caf50; }}
-  .img-added .img-badge {{ color: #14532d; }}
-  .img-removed {{ border-color: #e53935; opacity: 0.7; }}
-  .img-removed .img-badge {{ color: #7f1d1d; }}
+  body { font-family: Arial, sans-serif; max-width: 900px; margin: 40px auto;
+         padding: 0 16px; line-height: 1.6; color: #000; }
+  h1 { font-size: 20px; }
+  h2 { font-size: 16px; margin: 0 0 6px 0; }
+  .summary { background: #f5f5f5; padding: 12px 16px; border-radius: 6px;
+             margin-bottom: 24px; font-size: 14px; }
+  .row { padding: 8px 10px; border-radius: 4px; margin: 6px 0; }
+  .row.same { color: #000; }
+  .row.changed { background: #fff9e6; }
+  .row.added { background: #eaffea; }
+  .row.removed { background: #ffecec; }
+  .added { background: #c6f6c6; color: #14532d; padding: 1px 3px; border-radius: 3px; }
+  .removed { background: #f8c6c6; color: #7f1d1d; text-decoration: line-through;
+             padding: 1px 3px; border-radius: 3px; }
+  .legend span { margin-right: 16px; }
+  .img-inline { display: inline-block; vertical-align: top; margin: 8px 8px 0 0;
+                border: 1px solid #ddd; border-radius: 6px; padding: 6px;
+                background: #fff; }
+  .img-inline img { max-width: 260px; max-height: 260px; display: block; }
+  .img-badge { font-size: 11px; font-weight: bold; margin-bottom: 4px; }
+  .img-same { border-color: #ddd; }
+  .img-added { border-color: #4caf50; }
+  .img-added .img-badge { color: #14532d; }
+  .img-removed { border-color: #e53935; opacity: 0.7; }
+  .img-removed .img-badge { color: #7f1d1d; }
+
+  /* Requirement view */
+  .badge { display: inline-block; min-width: 86px; text-align: center; font-size: 12px;
+           font-weight: bold; padding: 1px 8px; border-radius: 10px; margin-right: 8px;
+           border: 1px solid transparent; }
+  .badge-same { background: #eee; color: #444; }
+  .badge-changed { background: #ffe9a8; color: #6b4a00; }
+  .badge-added { background: #c6f6c6; color: #14532d; }
+  .badge-removed { background: #f8c6c6; color: #7f1d1d; }
+  .badge-renumbered { background: #d6e4ff; color: #1e3a8a; }
+  .req { border: 1px solid #ddd; border-left-width: 6px; border-radius: 6px;
+         margin: 10px 0; padding: 0 10px; }
+  .req > summary { cursor: pointer; padding: 8px 0; font-weight: bold; }
+  .req .note { font-weight: normal; color: #555; font-size: 13px; margin-left: 6px; }
+  .req-same { border-left-color: #ccc; }
+  .req-changed { border-left-color: #e0a800; }
+  .req-added { border-left-color: #4caf50; }
+  .req-removed { border-left-color: #e53935; }
+  .req-renumbered { border-left-color: #3b6fd4; }
+  .changes-list { margin: 0; padding: 0; list-style: none; columns: 2; }
+  .changes-list li { margin: 3px 0; break-inside: avoid; }
+  .changes-list a { color: #000; }
+  .controls { margin: 10px 0 0 0; }
+  .controls button { margin-left: 12px; }
+  body.hide-same .req-same { display: none; }
 </style>
 </head>
 <body>
-  <h1>Comparing: {html.escape(name1)} vs {html.escape(name2)}</h1>
+  <h1>Comparing: $name1 vs $name2</h1>
   <div class="summary">
     <div class="legend">
       <span class="added">Added text</span>
       <span class="removed">Removed text</span>
     </div>
-    Paragraphs — unchanged: {summary['same']}, changed: {summary['changed']},
-    added: {summary['added']}, removed: {summary['removed']}<br>
-    Images — unchanged: {summary['img_same']}, added: {summary['img_added']},
-    removed: {summary['img_removed']}
+    $summary_lines
   </div>
-  {body_rows}
+  $body
 </body>
-</html>"""
+</html>""")
 
+
+def build_report(items1, items2, name1, name2, requirement_prefix=DEFAULT_REQUIREMENT_PREFIX):
+    """
+    Compare two documents and return (html_string, summary_counts).
+
+    If paragraphs starting with `requirement_prefix` are found, the report is
+    organised requirement by requirement. Otherwise (or if the prefix is
+    empty) it falls back to one plain paragraph-by-paragraph comparison.
+    """
+    prefix = (requirement_prefix or "").strip()
+    secs1 = split_requirements(items1, prefix) if prefix else []
+    secs2 = split_requirements(items2, prefix) if prefix else []
+    req_mode = any(not s["preamble"] for s in secs1 + secs2)
+
+    summary = {
+        "same": 0, "changed": 0, "added": 0, "removed": 0,
+        "img_same": 0, "img_added": 0, "img_removed": 0,
+        "req_mode": req_mode,
+        "req_same": 0, "req_changed": 0, "req_added": 0,
+        "req_removed": 0, "req_renumbered": 0,
+    }
+
+    def tally(counts, img_counts):
+        for k in ("same", "changed", "added", "removed"):
+            summary[k] += counts[k]
+        for k in ("same", "added", "removed"):
+            summary["img_" + k] += img_counts[k]
+
+    paragraph_lines = (
+        f"Paragraphs — unchanged: {{same}}, changed: {{changed}}, "
+        f"added: {{added}}, removed: {{removed}}<br>\n    "
+        f"Images — unchanged: {{img_same}}, added: {{img_added}}, removed: {{img_removed}}"
+    )
+
+    if not req_mode:
+        rows, counts, img_counts = diff_items(items1, items2)
+        tally(counts, img_counts)
+        note = ""
+        if prefix:
+            note = (f"No paragraphs starting with “{html.escape(prefix)}” were found, "
+                    f"so this is a plain paragraph-by-paragraph comparison.<br>\n    ")
+        page = PAGE_TEMPLATE.substitute(
+            name1=html.escape(name1), name2=html.escape(name2),
+            summary_lines=note + paragraph_lines.format(**summary),
+            body=rows_html(rows),
+        )
+        return page, summary
+
+    cards = []
+    index = []
+    for n, entry in enumerate(match_requirements(secs1, secs2)):
+        old, new = entry["old"], entry["new"]
+        rows, counts, img_counts = diff_items(old["items"] if old else [],
+                                              new["items"] if new else [])
+        tally(counts, img_counts)
+        edited_rows = sum(1 for kind, _ in rows if kind != "same")
+
+        note = ""
+        if old is None:
+            status = "added"
+        elif new is None:
+            status = "removed"
+        elif entry["renumbered"]:
+            status = "renumbered"
+            # The heading line always differs for a renumbered requirement;
+            # anything beyond that is a real content change.
+            extra = " — content also changed" if edited_rows > 1 else " — content unchanged"
+            note = f"was {old['name']}{extra}"
+        else:
+            status = "same" if edited_rows == 0 else "changed"
+
+        sec = new or old
+        if not sec["preamble"]:
+            summary["req_" + status] += 1
+
+        name = html.escape(sec["name"])
+        note_html = f'<span class="note">({html.escape(note)})</span>' if note else ""
+        badge = f'<span class="badge badge-{status}">{STATUS_LABELS[status]}</span>'
+        open_attr = "" if status == "same" else " open"
+        cards.append(
+            f'<details class="req req-{status}" id="req-{n}"{open_attr}>\n'
+            f'<summary>{badge}{name}{note_html}</summary>\n'
+            f'{rows_html(rows)}\n</details>'
+        )
+        if status != "same":
+            index.append(f'<li><a href="#req-{n}">{badge}{name}</a></li>')
+
+    if index:
+        index_html = ('<div class="summary"><h2>What changed</h2>\n'
+                      '<ul class="changes-list">\n' + "\n".join(index) + '\n</ul></div>')
+    else:
+        index_html = '<div class="summary"><h2>What changed</h2>Nothing — all requirements are identical.</div>'
+
+    controls = (
+        '<div class="controls">'
+        '<label><input type="checkbox" '
+        "onchange=\"document.body.classList.toggle('hide-same', this.checked)\"> "
+        'Show only requirements that changed</label>'
+        "<button onclick=\"document.querySelectorAll('details.req').forEach(function(d){d.open=true})\">Expand all</button>"
+        "<button onclick=\"document.querySelectorAll('details.req-same').forEach(function(d){d.open=false})\">Collapse unchanged</button>"
+        '</div>'
+    )
+    requirement_line = (
+        "Requirements — unchanged: {req_same}, changed: {req_changed}, "
+        "new: {req_added}, removed: {req_removed}, renumbered: {req_renumbered}<br>\n    "
+    )
+    page = PAGE_TEMPLATE.substitute(
+        name1=html.escape(name1), name2=html.escape(name2),
+        summary_lines=(requirement_line + paragraph_lines).format(**summary) + controls,
+        body=index_html + "\n" + "\n".join(cards),
+    )
     return page, summary
 
 
-def run_comparison(file1, file2, output_path):
+def run_comparison(file1, file2, output_path, requirement_prefix=DEFAULT_REQUIREMENT_PREFIX):
     """
     Do the full comparison and write the HTML report to output_path.
     Returns (summary_dict, diagnostic_message_or_None).
@@ -444,7 +755,8 @@ def run_comparison(file1, file2, output_path):
     items2 = extract_items(file2)
 
     page, summary = build_report(
-        items1, items2, os.path.basename(file1), os.path.basename(file2)
+        items1, items2, os.path.basename(file1), os.path.basename(file2),
+        requirement_prefix,
     )
 
     with open(output_path, "w", encoding="utf-8") as f:
@@ -507,19 +819,25 @@ class CompareApp:
         ttk.Entry(frame, textvariable=self.output_var, width=55).grid(row=5, column=0, columnspan=2, sticky="we", padx=10)
         ttk.Button(frame, text="Browse...", command=self.pick_output).grid(row=5, column=2, padx=10)
 
+        # --- Requirement marker ---
+        ttk.Label(frame, text="Each requirement starts with (leave empty for a plain comparison):").grid(
+            row=6, column=0, columnspan=3, sticky="w", **padding)
+        self.prefix_var = tk.StringVar(value=DEFAULT_REQUIREMENT_PREFIX)
+        ttk.Entry(frame, textvariable=self.prefix_var, width=55).grid(row=7, column=0, columnspan=2, sticky="we", padx=10)
+
         # --- Compare button ---
         self.compare_btn = ttk.Button(frame, text="Compare", command=self.start_compare)
-        self.compare_btn.grid(row=6, column=0, columnspan=3, pady=(16, 6))
+        self.compare_btn.grid(row=8, column=0, columnspan=3, pady=(16, 6))
 
         # --- Status label ---
         self.status_var = tk.StringVar(value="")
         ttk.Label(frame, textvariable=self.status_var, foreground="#000", wraplength=460, justify="left").grid(
-            row=7, column=0, columnspan=3, sticky="w", padx=10
+            row=9, column=0, columnspan=3, sticky="w", padx=10
         )
 
         # --- Open report button (hidden until a report exists) ---
         self.open_btn = ttk.Button(frame, text="Open report", command=self.open_report)
-        self.open_btn.grid(row=8, column=0, columnspan=3, pady=(6, 0))
+        self.open_btn.grid(row=10, column=0, columnspan=3, pady=(6, 0))
         self.open_btn.grid_remove()
         self.last_output_path = None
 
@@ -569,11 +887,11 @@ class CompareApp:
         self.status_var.set("Comparing... this may take a few seconds for large files.")
 
         # Run the comparison in a background thread so the window doesn't freeze.
-        threading.Thread(target=self._compare_worker, args=(file1, file2, output), daemon=True).start()
+        threading.Thread(target=self._compare_worker, args=(file1, file2, output, self.prefix_var.get().strip()), daemon=True).start()
 
-    def _compare_worker(self, file1, file2, output):
+    def _compare_worker(self, file1, file2, output, prefix):
         try:
-            summary, diagnostic = run_comparison(file1, file2, output)
+            summary, diagnostic = run_comparison(file1, file2, output, prefix)
             self.root.after(0, self._compare_done, summary, diagnostic, output, None)
         except Exception as exc:
             self.root.after(0, self._compare_done, None, None, output, exc)
@@ -593,6 +911,15 @@ class CompareApp:
             f"Images — unchanged: {summary['img_same']}, added: {summary['img_added']}, "
             f"removed: {summary['img_removed']}",
         ]
+        if summary["req_mode"]:
+            lines.insert(1, (
+                f"Requirements — unchanged: {summary['req_same']}, changed: {summary['req_changed']}, "
+                f"new: {summary['req_added']}, removed: {summary['req_removed']}, "
+                f"renumbered: {summary['req_renumbered']}"))
+        elif self.prefix_var.get().strip():
+            lines.insert(1, (
+                f"No paragraphs starting with \"{self.prefix_var.get().strip()}\" were found, "
+                f"so a plain comparison was made."))
         if diagnostic:
             lines.append("")
             lines.append(diagnostic)
