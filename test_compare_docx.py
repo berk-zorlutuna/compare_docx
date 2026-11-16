@@ -261,6 +261,41 @@ def test_image_replaced_marks_row_as_changed(tmp_path):
     assert s["same"] == 0, s
 
 
+def test_resaved_identical_figure_is_unchanged(tmp_path):
+    """Same pixels, different file bytes (re-saved by Word / another tool)."""
+    def build(**save_kwargs):
+        def b(doc):
+            buf = io.BytesIO()
+            Image.new("RGB", (40, 40), "red").save(buf, **save_kwargs)
+            buf.seek(0)
+            doc.add_paragraph("Fig").add_run().add_picture(buf, width=Inches(1))
+        return b
+    a, b = build(format="PNG", compress_level=1), build(format="BMP")
+    s, d, _ = compare(tmp_path, a, b)
+    assert (s["img_same"], s["img_added"], s["img_removed"]) == (1, 0, 0), s
+    assert s["same"] == 1 and d is None
+
+
+def test_one_pixel_difference_is_still_a_change(tmp_path):
+    def build(dot):
+        def b(doc):
+            im = Image.new("RGB", (40, 40), "red")
+            if dot:
+                im.putpixel((5, 5), (0, 0, 0))
+            buf = io.BytesIO(); im.save(buf, "PNG"); buf.seek(0)
+            doc.add_paragraph("Fig").add_run().add_picture(buf, width=Inches(1))
+        return b
+    s, _, _ = compare(tmp_path, build(False), build(True))
+    assert (s["img_added"], s["img_removed"]) == (1, 1), s
+
+
+def test_without_pillow_falls_back_to_bytes(tmp_path, monkeypatch):
+    monkeypatch.setattr(cd, "Image", None)
+    s, _, _ = compare(tmp_path, with_img("Fig", "red"), with_img("Fig", "red"))
+    assert s["img_same"] == 1
+    assert cd.image_fingerprint(b"not an image") == cd.image_fingerprint(b"not an image")
+
+
 def test_image_added_and_removed(tmp_path):
     s, _, _ = compare(tmp_path, with_img("Fig"), with_img("Fig", "red"))
     assert (s["img_same"], s["img_added"], s["img_removed"]) == (0, 1, 0)

@@ -7,8 +7,11 @@ changed, with word-level highlighting.
 ## Run it
 
 ```bash
-pip install python-docx
+pip install python-docx pillow
 ```
+
+`pillow` is optional but recommended: with it, a figure counts as unchanged when
+it looks the same, even if Word re-saved the image file.
 
 ```bash
 python compare_docx.py

@@ -17,6 +17,7 @@ import base64
 import difflib
 import hashlib
 import html
+import io
 import os
 import pathlib
 import string
@@ -30,6 +31,11 @@ from tkinter import filedialog, messagebox, ttk
 
 from docx import Document
 from docx.oxml.ns import qn
+
+try:  # Optional: lets pictures be compared by what they look like.
+    from PIL import Image
+except ImportError:
+    Image = None
 
 
 # ===========================================================================
@@ -77,6 +83,27 @@ def _walk(element, stay_in_paragraph=False):
         yield from _walk(child, stay_in_paragraph)
 
 
+def image_fingerprint(data):
+    """
+    Return a fingerprint that is equal for two pictures that look the same.
+
+    With Pillow installed, the picture is decoded and its pixels are
+    fingerprinted, so a figure that Word merely re-saved (different
+    compression, metadata or file type, identical pixels) still counts as
+    unchanged. Without Pillow, or for formats it can't read (EMF/WMF), the
+    raw file bytes are used, which treats any re-saved file as different.
+    """
+    if Image is not None:
+        try:
+            with Image.open(io.BytesIO(data)) as im:
+                im = im.convert("RGBA")
+                pixels = im.tobytes()
+                return hashlib.md5(repr(im.size).encode() + pixels).hexdigest()
+        except Exception:
+            pass
+    return hashlib.md5(data).hexdigest()
+
+
 def extract_items(path):
     """
     Walk through a .docx file's raw XML in document order and return a list
@@ -102,6 +129,7 @@ def extract_items(path):
     doc = Document(path)
     body = doc.element.body
     items = []
+    fingerprints = {}
 
     for p_elm in _walk(body):
         if p_elm.tag != W_P:
@@ -140,11 +168,13 @@ def extract_items(path):
                 continue
             data = part.blob
             partname = str(part.partname)
+            if partname not in fingerprints:  # a reused picture is decoded once
+                fingerprints[partname] = image_fingerprint(data)
             images.append({
                 "filename": partname.split("/")[-1],
                 "partname": partname,
                 "bytes": data,
-                "hash": hashlib.md5(data).hexdigest(),
+                "hash": fingerprints[partname],
             })
 
         text = "".join(text_parts).strip()
