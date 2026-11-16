@@ -27,6 +27,8 @@ text can be changed in the window), the report is organised per requirement:
 - each requirement is marked Unchanged, Changed, New, Removed or Renumbered
 - a "What changed" list at the top links to every requirement that differs
 - unchanged requirements are collapsed, and can be hidden with one tick box
+- titles (paragraphs in a Word heading or title style) are separate items, so
+  a title is never treated as part of the requirement above it
 - a requirement whose number changed but whose content is (nearly) the same
   is recognised as renumbered, so inserting one requirement doesn't make
   every later one look rewritten

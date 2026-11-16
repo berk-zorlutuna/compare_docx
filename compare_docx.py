@@ -104,13 +104,70 @@ def image_fingerprint(data):
     return hashlib.md5(data).hexdigest()
 
 
+def heading_styles(doc):
+    """
+    Return the set of paragraph style IDs that are titles/headings in this
+    document: Word's built-in "Title", "Subtitle" and "Heading 1-9" styles,
+    any style given an outline level, and any style based on one of those.
+    (Word keeps the built-in style *names* in English in every language
+    version, so this also works for non-English documents.)
+    """
+    info = {}
+    for style in doc.styles.element.iter(qn("w:style")):
+        style_id = style.get(qn("w:styleId"))
+        name_el = style.find(qn("w:name"))
+        based_el = style.find(qn("w:basedOn"))
+        name = (name_el.get(qn("w:val")) or "").lower() if name_el is not None else ""
+        based_on = based_el.get(qn("w:val")) if based_el is not None else None
+        own = (name in ("title", "subtitle") or name.startswith("heading ")
+               or _has_outline_level(style.find(qn("w:pPr"))))
+        info[style_id] = (own, based_on)
+
+    result = set()
+    for style_id in info:
+        current, hops = style_id, 0
+        while current in info and hops < 20:
+            own, based_on = info[current]
+            if own:
+                result.add(style_id)
+                break
+            current, hops = based_on, hops + 1
+    return result
+
+
+def _has_outline_level(ppr):
+    """True if these paragraph properties set an outline level (0-8 = heading levels)."""
+    if ppr is None:
+        return False
+    lvl = ppr.find(qn("w:outlineLvl"))
+    if lvl is None:
+        return False
+    try:
+        return int(lvl.get(qn("w:val"))) < 9
+    except (TypeError, ValueError):
+        return False
+
+
+def is_heading(p_elm, heading_style_ids):
+    """Is this paragraph a title/heading (by its style or its outline level)?"""
+    ppr = p_elm.find(qn("w:pPr"))
+    if ppr is None:
+        return False
+    if _has_outline_level(ppr):
+        return True
+    style = ppr.find(qn("w:pStyle"))
+    return style is not None and style.get(qn("w:val")) in heading_style_ids
+
+
 def extract_items(path):
     """
     Walk through a .docx file's raw XML in document order and return a list
     of paragraph items, one per non-empty paragraph:
 
-        {"text": "...", "images": [{"filename": ..., "partname": ...,
-                                    "bytes": ..., "hash": ...}, ...]}
+        {"text": "...", "heading": True/False,
+         "images": [{"filename": ..., "partname": ..., "bytes": ..., "hash": ...}, ...]}
+
+    "heading" is True for titles (paragraphs using a Word heading/title style).
 
     Scanning the raw XML (rather than only python-docx's top-level paragraph
     list) means content is found no matter how it's nested — inside tables,
@@ -130,6 +187,7 @@ def extract_items(path):
     body = doc.element.body
     items = []
     fingerprints = {}
+    heading_ids = heading_styles(doc)
 
     for p_elm in _walk(body):
         if p_elm.tag != W_P:
@@ -181,7 +239,8 @@ def extract_items(path):
         if not text and not images:
             continue  # skip fully empty paragraphs
 
-        items.append({"text": text, "images": images})
+        items.append({"text": text, "images": images,
+                      "heading": bool(text) and is_heading(p_elm, heading_ids)})
 
     return items
 
@@ -434,8 +493,13 @@ def split_requirements(items, prefix):
         {"id": "12" or None, "name": "Requirement Number 12",
          "items": [...paragraphs...], "words": [...words used for matching...]}
 
-    Any text before the first requirement becomes a section with
-    "preamble": True.
+    Each section has a "kind":
+      - "req":      a requirement
+      - "title":    a title/heading paragraph (plus any loose text under it,
+                    up to the next requirement or title). Titles are kept
+                    as items of their own so they are never mistaken for
+                    part of the requirement above them.
+      - "preamble": any text before the first requirement or title
 
     The requirement's ID is the first word after the prefix
     ("Requirement Number 12: ..." -> "12", "Requirement Number: REQ-7" ->
@@ -464,13 +528,22 @@ def split_requirements(items, prefix):
                 "name": f"{prefix} {req_id}".strip(),
                 "items": [it],
                 "words": list(body_words),
-                "preamble": False,
+                "kind": "req",
+            }
+            sections.append(current)
+        elif it.get("heading"):
+            current = {
+                "id": None,
+                "name": text if len(text) <= 120 else text[:117] + "...",
+                "items": [it],
+                "words": text.split(),
+                "kind": "title",
             }
             sections.append(current)
         else:
             if current is None:
                 current = {"id": None, "name": "Text before the first requirement",
-                           "items": [], "words": [], "preamble": True}
+                           "items": [], "words": [], "kind": "preamble"}
                 sections.append(current)
             current["items"].append(it)
             current["words"].extend(text.split())
@@ -503,14 +576,19 @@ def match_requirements(old_secs, new_secs):
          (This is what keeps the report readable when a requirement is
          inserted in the middle and everything after it shifts by one.)
       3. Same number, content heavily rewritten -> same requirement.
-      4. Whatever is left is new (only in the new file) or removed.
+      4. A title that was renamed but still sits next to the same section.
+      5. Whatever is left is new (only in the new file) or removed.
     """
     def keyed(secs):
         seen = Counter()
         out = {}
         for sec in secs:
-            if sec["preamble"]:
+            if sec["kind"] == "preamble":
                 key = ("preamble",)
+            elif sec["kind"] == "title":
+                base = " ".join(sec["items"][0]["text"].lower().split())
+                key = ("title", base, seen[("title", base)])
+                seen[("title", base)] += 1
             else:
                 base = (sec["id"] or "").lower()
                 key = ("req", base, seen[base])  # 3rd part separates duplicate numbers
@@ -539,10 +617,12 @@ def match_requirements(old_secs, new_secs):
     if len(free_old) * len(free_new) <= MAX_ALIGN_CELLS:
         matcher = difflib.SequenceMatcher(None, autojunk=False)
         for new in free_new:
-            best, best_score = None, RENUMBER_THRESHOLD
+            # Titles are short, so a reworded title needs a gentler threshold.
+            best = None
+            best_score = RENUMBER_THRESHOLD if new["kind"] == "req" else SIMILARITY_THRESHOLD
             matcher.set_seq2(new["words"])
             for old in free_old:
-                if id(old) in used_old:
+                if id(old) in used_old or old["kind"] != new["kind"]:
                     continue
                 matcher.set_seq1(old["words"])
                 if matcher.real_quick_ratio() < best_score or matcher.quick_ratio() < best_score:
@@ -553,13 +633,32 @@ def match_requirements(old_secs, new_secs):
                     if score == 1.0:
                         break
             if best is not None:
-                pair(best, new, True)
+                pair(best, new, new["kind"] == "req")
 
     # Pass 3: same number, even though the content was heavily rewritten.
     for key, new in new_by_key.items():
         old = old_by_key.get(key)
         if id(new) not in partner_of_new and old is not None and id(old) not in used_old:
             pair(old, new, False)
+
+    # Pass 4: a renamed title. An unmatched title in each file counts as the
+    # same title when it sits directly before (or after) the same section.
+    old_index = {id(s): i for i, s in enumerate(old_secs)}
+    for j, new in enumerate(new_secs):
+        if new["kind"] != "title" or id(new) in partner_of_new:
+            continue
+        for step in (1, -1):
+            if not 0 <= j + step < len(new_secs):
+                continue
+            neighbour_old = partner_of_new.get(id(new_secs[j + step]), (None, False))[0]
+            if neighbour_old is None:
+                continue
+            i = old_index[id(neighbour_old)] - step
+            if 0 <= i < len(old_secs):
+                candidate = old_secs[i]
+                if candidate["kind"] == "title" and id(candidate) not in used_old:
+                    pair(candidate, new, False)
+                    break
 
     # Report order: the new document's order, with removed requirements
     # slotted in after whatever preceded them in the old document.
@@ -641,6 +740,11 @@ PAGE_TEMPLATE = string.Template("""<!DOCTYPE html>
   .req-added { border-left-color: #4caf50; }
   .req-removed { border-left-color: #e53935; }
   .req-renumbered { border-left-color: #3b6fd4; }
+  .kind-title { background: #f3f4f6; margin-top: 22px; }
+  .kind-title > summary { font-size: 17px; }
+  .title-tag { font-size: 11px; font-weight: bold; text-transform: uppercase; color: #555;
+               border: 1px solid #999; border-radius: 3px; padding: 0 5px; margin-right: 8px;
+               vertical-align: middle; }
   .changes-list { margin: 0; padding: 0; list-style: none; columns: 2; }
   .changes-list li { margin: 3px 0; break-inside: avoid; }
   .changes-list a { color: #000; }
@@ -674,7 +778,7 @@ def build_report(items1, items2, name1, name2, requirement_prefix=DEFAULT_REQUIR
     prefix = (requirement_prefix or "").strip()
     secs1 = split_requirements(items1, prefix) if prefix else []
     secs2 = split_requirements(items2, prefix) if prefix else []
-    req_mode = any(not s["preamble"] for s in secs1 + secs2)
+    req_mode = any(s["kind"] == "req" for s in secs1 + secs2)
 
     summary = {
         "same": 0, "changed": 0, "added": 0, "removed": 0,
@@ -682,6 +786,7 @@ def build_report(items1, items2, name1, name2, requirement_prefix=DEFAULT_REQUIR
         "req_mode": req_mode,
         "req_same": 0, "req_changed": 0, "req_added": 0,
         "req_removed": 0, "req_renumbered": 0,
+        "title_same": 0, "title_changed": 0, "title_added": 0, "title_removed": 0,
     }
 
     def tally(counts, img_counts):
@@ -734,15 +839,19 @@ def build_report(items1, items2, name1, name2, requirement_prefix=DEFAULT_REQUIR
             status = "same" if edited_rows == 0 else "changed"
 
         sec = new or old
-        if not sec["preamble"]:
+        if sec["kind"] == "req":
             summary["req_" + status] += 1
+        elif sec["kind"] == "title":
+            summary["title_" + status] += 1
 
         name = html.escape(sec["name"])
+        if sec["kind"] == "title":
+            name = f'<span class="title-tag">Title</span>{name}'
         note_html = f'<span class="note">({html.escape(note)})</span>' if note else ""
         badge = f'<span class="badge badge-{status}">{STATUS_LABELS[status]}</span>'
         open_attr = "" if status == "same" else " open"
         cards.append(
-            f'<details class="req req-{status}" id="req-{n}"{open_attr}>\n'
+            f'<details class="req req-{status} kind-{sec["kind"]}" id="req-{n}"{open_attr}>\n'
             f'<summary>{badge}{name}{note_html}</summary>\n'
             f'{rows_html(rows)}\n</details>'
         )
@@ -768,6 +877,11 @@ def build_report(items1, items2, name1, name2, requirement_prefix=DEFAULT_REQUIR
         "Requirements — unchanged: {req_same}, changed: {req_changed}, "
         "new: {req_added}, removed: {req_removed}, renumbered: {req_renumbered}<br>\n    "
     )
+    if any(summary["title_" + k] for k in ("same", "changed", "added", "removed")):
+        requirement_line += (
+            "Titles — unchanged: {title_same}, changed: {title_changed}, "
+            "new: {title_added}, removed: {title_removed}<br>\n    "
+        )
     page = PAGE_TEMPLATE.substitute(
         name1=html.escape(name1), name2=html.escape(name2),
         summary_lines=(requirement_line + paragraph_lines).format(**summary) + controls,

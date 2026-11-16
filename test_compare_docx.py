@@ -365,8 +365,8 @@ def req_counts(s):
 def cards(page):
     """[(status, visible title text)] for each requirement card, in report order."""
     out = []
-    for status, summary in re.findall(r'<details class="req req-(\w+)"[^>]*>\n<summary>(.*?)</summary>', page):
-        out.append((status, re.sub(r"<[^>]+>", "|", summary).strip("|")))
+    for status, summary in re.findall(r'<details class="req req-(\w+)[^"]*"[^>]*>\n<summary>(.*?)</summary>', page):
+        out.append((status, re.sub(r"(<[^>]+>)+", "|", summary).strip("|")))
     return out
 
 
@@ -376,7 +376,7 @@ R3 = ["Requirement Number 3", "Passwords shall be at least twelve characters lon
 
 
 def test_split_requirements_ids():
-    items = [{"text": t, "images": []} for t in [
+    items = [{"text": t, "images": [], "heading": False} for t in [
         "Document title",
         "Requirement Number 5: The system shall work",
         "Requirement Number: REQ-007", "Body",
@@ -384,7 +384,7 @@ def test_split_requirements_ids():
         "Requirement Number", "42", "Body in next cell",
     ]]
     secs = cd.split_requirements(items, "Requirement Number")
-    assert secs[0]["preamble"] and len(secs[0]["items"]) == 1
+    assert secs[0]["kind"] == "preamble" and len(secs[0]["items"]) == 1
     assert [s["id"] for s in secs[1:]] == ["5", "REQ-007", "3.2.1", "42"]
     assert secs[1]["words"] == ["The", "system", "shall", "work"]
 
@@ -398,7 +398,7 @@ def test_requirements_unchanged_changed_added_removed(tmp_path):
     assert [c[0] for c in cards(page)] == ["same", "same", "changed", "removed", "added"]
     assert '<span class="removed">five</span>' in page and '<span class="added">three</span>' in page
     # unchanged requirements are collapsed, changed ones are open
-    assert re.search(r'req-same" id="req-1">', page) and re.search(r'req-changed" id="req-2" open>', page)
+    assert re.search(r'req-same kind-req" id="req-1">', page) and re.search(r'req-changed kind-req" id="req-2" open>', page)
     # index lists only what changed
     assert page.count('<li><a href="#req-') == 3
 
@@ -481,6 +481,76 @@ def test_duplicate_requirement_numbers(tmp_path):
     b = ["Requirement Number 1", "Second text about archiving records."]
     s, _, _ = compare(tmp_path, paras(*a, *b), paras(*a, *b))
     assert req_counts(s) == (2, 0, 0, 0, 0), s
+
+
+def doc_with_titles(*parts):
+    """parts: ("h", text) for a heading, ("t", text) for a Title-style line, else plain text."""
+    def build(doc):
+        for p in parts:
+            if isinstance(p, tuple) and p[0] == "h":
+                doc.add_heading(p[1], level=1)
+            elif isinstance(p, tuple) and p[0] == "t":
+                doc.add_heading(p[1], level=0)
+            else:
+                doc.add_paragraph(p)
+    return build
+
+
+def test_titles_are_separate_items(tmp_path):
+    build = doc_with_titles(("t", "System Requirements"), ("h", "Access control"), *R1, *R2,
+                            ("h", "Passwords"), "This chapter covers passwords.", *R3)
+    s, _, page = compare(tmp_path, build, build)
+    assert req_counts(s) == (3, 0, 0, 0, 0), s
+    assert (s["title_same"], s["title_changed"], s["title_added"], s["title_removed"]) == (3, 0, 0, 0)
+    assert [c[1] for c in cards(page)] == [
+        "Unchanged|Title|System Requirements", "Unchanged|Title|Access control",
+        "Unchanged|Requirement Number 1", "Unchanged|Requirement Number 2",
+        "Unchanged|Title|Passwords", "Unchanged|Requirement Number 3"]
+    # the title is not inside the requirement that precedes it
+    secs = cd.split_requirements(cd.extract_items(str(tmp_path / "old.docx")), "Requirement Number")
+    assert [len(x["items"]) for x in secs] == [1, 1, 2, 2, 2, 3]
+
+
+def test_title_change_does_not_touch_neighbouring_requirement(tmp_path):
+    old = doc_with_titles(*R1, ("h", "Passwords"), *R3)
+    new = doc_with_titles(*R1, ("h", "Password rules"), *R3)
+    s, _, page = compare(tmp_path, old, new)
+    assert req_counts(s) == (2, 0, 0, 0, 0), s
+    assert (s["title_same"], s["title_changed"], s["title_added"], s["title_removed"]) == (0, 1, 0, 0)
+    assert '<span class="removed">Passwords</span>' in page
+    assert '<span class="added">Password rules</span>' in page
+
+
+def test_title_added_and_removed(tmp_path):
+    old = doc_with_titles(("h", "Legacy interfaces"), *R1, *R2)
+    new = doc_with_titles(*R1, ("h", "Account locking"), *R2)
+    s, _, page = compare(tmp_path, old, new)
+    assert req_counts(s) == (2, 0, 0, 0, 0), s
+    assert (s["title_added"], s["title_removed"]) == (1, 1)
+    assert [c[0] for c in cards(page)] == ["removed", "same", "added", "same"]
+
+
+def test_custom_heading_style_and_outline_level(tmp_path):
+    def build(doc):
+        from docx.enum.style import WD_STYLE_TYPE
+        st = doc.styles.add_style("ChapterName", WD_STYLE_TYPE.PARAGRAPH)
+        st.base_style = doc.styles["Heading 2"]
+        doc.add_paragraph("Chapter one", style="ChapterName")
+        doc.add_paragraph("Plain body")
+        p = doc.add_paragraph("Outline-level title")
+        p._p.get_or_add_pPr().append(parse_xml(f'<w:outlineLvl {nsdecls("w")} w:val="1"/>'))
+        q = doc.add_paragraph("Body-level text")
+        q._p.get_or_add_pPr().append(parse_xml(f'<w:outlineLvl {nsdecls("w")} w:val="9"/>'))
+    items = cd.extract_items(make(tmp_path, "a.docx", build))
+    assert [(i["text"], i["heading"]) for i in items] == [
+        ("Chapter one", True), ("Plain body", False),
+        ("Outline-level title", True), ("Body-level text", False)]
+
+
+def test_requirement_line_in_heading_style_is_a_requirement(tmp_path):
+    build = doc_with_titles(("h", "Requirement Number 1"), "Body one.", ("h", "Requirement Number 2"), "Body two.")
+    s, _, _ = compare(tmp_path, build, build)
+    assert req_counts(s) == (2, 0, 0, 0, 0) and s["title_same"] == 0
 
 
 def test_custom_and_empty_prefix(tmp_path):
