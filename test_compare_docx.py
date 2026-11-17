@@ -602,3 +602,313 @@ def test_report_title_uses_file_names(tmp_path):
     _, _, page = compare(tmp_path, paras("x"), paras("x"))
     title = re.search(r"<h1>(.*?)</h1>", page).group(1)
     assert title == "Comparing: old.docx vs new.docx", title
+
+
+# ---------- PDF ----------
+
+import shutil
+import subprocess
+
+pymupdf = pytest.importorskip("pymupdf")
+
+
+def make_pdf(tmp_path, name, pages, header=None, footer=None, size=(595, 842)):
+    """
+    pages: list of pages; each page is a list of (text, fontsize) lines or
+    ("IMG", png_bytes) entries, laid out top to bottom. (text, fontsize, x)
+    places a piece on the previous line at x (same baseline).
+    """
+    doc = pymupdf.open()
+    for n, lines in enumerate(pages, 1):
+        page = doc.new_page(width=size[0], height=size[1])
+        if header:
+            page.insert_text((72, 40), header, fontsize=9)
+        if footer:
+            page.insert_text((72, size[1] - 30), footer.format(n=n, total=len(pages)), fontsize=9)
+        y = 100
+        for entry in lines:
+            if entry[0] == "IMG":
+                page.insert_image(pymupdf.Rect(72, y, 272, y + 100), stream=entry[1])
+                y += 115
+                continue
+            text, fs = entry[0], entry[1]
+            if len(entry) == 3:   # same line as previous, at x
+                page.insert_text((entry[2], y - fs * 1.3), text, fontsize=fs)
+                continue
+            if text == "":        # blank line = paragraph gap
+                y += 10
+                continue
+            page.insert_text((72, y), text, fontsize=fs)
+            y += fs * 1.3
+    path = str(tmp_path / name)
+    doc.save(path)
+    return path
+
+
+def texts(items):
+    return [("#" if i["heading"] else "") + (i["text"] or "[img]") for i in items]
+
+
+def test_is_pdf(tmp_path):
+    p = make_pdf(tmp_path, "a.pdf", [[("Hello world here", 11)]])
+    d = make(tmp_path, "a.docx", paras("x"))
+    assert cd.is_pdf(p) and not cd.is_pdf(d)
+
+
+def test_pdf_paragraphs_headers_footers_and_page_breaks(tmp_path):
+    body = 11
+    pages = [
+        [("Chapter one", 16), ("", 0),
+         ("This is the first paragraph of the document.", body), ("", 0),
+         ("This paragraph is long and continues on the", body),
+         ("next line and then over the page break", body)],
+        [("into the second page where it ends.", body), ("", 0),
+         ("Requirement Number 1", body), ("", 0),
+         ("The unit shall work.", body)],
+        [("Last page text here for the check.", body)],
+    ]
+    p = make_pdf(tmp_path, "a.pdf", pages, header="ACME Spec Rev A", footer="Page {n} of {total}")
+    assert texts(cd.extract_items_pdf(p, "Requirement Number")) == [
+        "#Chapter one",
+        "This is the first paragraph of the document.",
+        "This paragraph is long and continues on the next line and then over the page break "
+        "into the second page where it ends.",
+        "Requirement Number 1",
+        "The unit shall work.",
+        "Last page text here for the check.",
+    ]
+
+
+def test_pdf_requirement_line_always_starts_a_paragraph(tmp_path):
+    p = make_pdf(tmp_path, "a.pdf", [[
+        ("The pump shall start within two seconds of the command being received by", 11),
+        ("Requirement Number 2", 11),
+        ("The valve shall close.", 11)]])
+    assert texts(cd.extract_items_pdf(p, "Requirement Number")) == [
+        "The pump shall start within two seconds of the command being received by",
+        "Requirement Number 2 The valve shall close."]
+    # without the marker, the line would have been glued onto the paragraph above
+    assert len(cd.extract_items_pdf(p, "")) == 1
+
+
+def test_pdf_automatic_numbers_dropped_but_typed_numbers_kept(tmp_path):
+    p = make_pdf(tmp_path, "a.pdf", [[
+        ("3", 16), ("Power supply", 16, 100), ("", 0),          # numbered title: label dropped
+        ("1.", 11), ("Over-voltage", 11, 100),                    # list item: label dropped
+        ("2.", 11), ("Under-voltage", 11, 100), ("", 0),
+        ("Retries", 11), ("3", 11, 200), ("", 0),                 # table-like value: kept
+        ("10 seconds is the limit.", 11)]])                       # typed number: kept
+    assert texts(cd.extract_items_pdf(p)) == [
+        "#Power supply", "Over-voltage", "Under-voltage", "Retries 3", "10 seconds is the limit."]
+
+
+def test_pdf_dot_leaders_removed(tmp_path):
+    p = make_pdf(tmp_path, "a.pdf", [[("Introduction ............................ 3", 11)]])
+    assert texts(cd.extract_items_pdf(p)) == ["Introduction 3"]
+
+
+def test_scanned_pdf_is_rejected(tmp_path):
+    p = make_pdf(tmp_path, "scan.pdf", [[("IMG", png("grey", (200, 200)).getvalue())]])
+    with pytest.raises(ValueError, match="scanned"):
+        cd.extract_items_pdf(p)
+
+
+def test_password_pdf_is_rejected(tmp_path):
+    doc = pymupdf.open()
+    doc.new_page().insert_text((72, 72), "Secret text for the test", fontsize=11)
+    p = str(tmp_path / "locked.pdf")
+    doc.save(p, encryption=pymupdf.PDF_ENCRYPT_AES_256, user_pw="pw", owner_pw="pw")
+    with pytest.raises(ValueError, match="password"):
+        cd.extract_items_pdf(p)
+
+
+def test_missing_pymupdf_gives_install_hint(tmp_path, monkeypatch):
+    p = make_pdf(tmp_path, "a.pdf", [[("Hello world here", 11)]])
+    monkeypatch.setattr(cd, "pymupdf", None)
+    with pytest.raises(RuntimeError, match="pip install pymupdf"):
+        cd.run_comparison(p, p, str(tmp_path / "r.html"))
+
+
+def rgba_png():
+    im = Image.new("RGBA", (120, 60), (0, 0, 0, 0))
+    for x in range(20, 100):
+        for y in range(10, 50):
+            im.putpixel((x, y), (200, 30, 30, 255))
+    b = io.BytesIO(); im.save(b, "PNG")
+    return b.getvalue()
+
+
+def test_pdf_transparent_image_matches_word_image(tmp_path):
+    data = rgba_png()
+    pdf = make_pdf(tmp_path, "a.pdf", [[("See the figure below here.", 11), ("IMG", data)]])
+    def build(doc):
+        doc.add_paragraph("See the figure below here.")
+        doc.add_paragraph().add_run().add_picture(io.BytesIO(data), width=Inches(2))
+    docx = make(tmp_path, "a.docx", build)
+    s, _ = cd.run_comparison(docx, pdf, str(tmp_path / "r.html"))
+    assert (s["same"], s["changed"], s["img_same"], s["img_added"], s["img_removed"]) == (2, 0, 1, 0, 0), s
+
+
+def figure(label="Pump P-101", size=(600, 300)):
+    from PIL import ImageDraw
+    im = Image.new("RGB", size, "white")
+    d = ImageDraw.Draw(im)
+    for i in range(8):
+        d.rectangle((20 + i * 70, 80 + (i % 3) * 40, 70 + i * 70, 120 + (i % 3) * 40), outline="black", width=2)
+    d.text((30, 30), label, fill="black")
+    return im
+
+
+def encoded(im, fmt="PNG", scale=1.0, **kw):
+    if scale != 1.0:
+        im = im.resize((int(im.width * scale), int(im.height * scale)), Image.LANCZOS)
+    b = io.BytesIO(); im.save(b, fmt, **kw)
+    return {"bytes": b.getvalue()}
+
+
+@pytest.mark.parametrize("new, expected", [
+    (encoded(figure(), "JPEG", quality=70), "resaved"),
+    (encoded(figure(), "JPEG", scale=0.5, quality=75), "resized"),
+    (encoded(figure("Pump P-102")), None),                       # one character changed
+    (encoded(figure("Pump P-102"), "JPEG", quality=70), None),   # ...also after re-compression
+    (encoded(figure(size=(600, 400))), None),                    # different shape
+    (encoded(Image.new("RGB", (600, 300), "navy")), None),       # different picture
+])
+def test_compare_by_appearance(new, expected):
+    old = encoded(figure())
+    got = cd.compare_by_appearance(old, new, cd.image_thumbnail(old["bytes"]), cd.image_thumbnail(new["bytes"]))
+    assert got == expected
+
+
+def test_resized_figure_is_flagged_in_report(tmp_path):
+    small = encoded(figure(), "JPEG", scale=0.5, quality=75)["bytes"]
+    pdf = make_pdf(tmp_path, "a.pdf", [[("Figure text here for test.", 11), ("IMG", small)]])
+    def build(doc):
+        doc.add_paragraph("Figure text here for test.")
+        doc.add_paragraph().add_run().add_picture(io.BytesIO(encoded(figure())["bytes"]), width=Inches(2))
+    docx = make(tmp_path, "a.docx", build)
+    out = str(tmp_path / "r.html")
+    s, _ = cd.run_comparison(docx, pdf, out)
+    assert (s["img_same"], s["img_check"], s["img_added"], s["img_removed"]) == (1, 1, 0, 0)
+    page = open(out, encoding="utf-8").read()
+    assert "please check their details" in page and "img-resized" in page
+
+
+def test_requirement_with_resized_figure_is_listed_for_checking(tmp_path):
+    small = encoded(figure("Pump P-102"), "JPEG", scale=0.5, quality=75)["bytes"]  # label edited!
+    pdf = make_pdf(tmp_path, "a.pdf", [[("Requirement Number 1", 11), ("", 0), ("Text of one.", 11), ("", 0),
+                                        ("Requirement Number 2", 11), ("", 0), ("Figure below.", 11),
+                                        ("IMG", small)]])
+    def build(doc):
+        paras("Requirement Number 1", "Text of one.", "Requirement Number 2", "Figure below.")(doc)
+        doc.add_paragraph().add_run().add_picture(io.BytesIO(encoded(figure())["bytes"]), width=Inches(2))
+    docx = make(tmp_path, "a.docx", build)
+    out = str(tmp_path / "r.html")
+    s, _ = cd.run_comparison(docx, pdf, out)
+    assert (s["req_same"], s["req_check"], s["req_changed"]) == (1, 1, 0), s
+    assert change_list(out) == [("Check figure", "Requirement Number 2")]
+    page = open(out, encoding="utf-8").read()
+    assert "figure to check: 1" in page
+    assert page.count("<img ") == 2 and "Old version" in page  # old shown next to new
+
+
+def test_flow_diff_ignores_paragraph_breaks():
+    old = [{"text": "Alpha beta gamma delta.", "images": []}, {"text": "Epsilon zeta.", "images": []}]
+    new = [{"text": "Alpha beta", "images": []}, {"text": "gamma delta. Epsilon zeta.", "images": []}]
+    rows, counts, _ = cd.diff_items_flow(old, new)
+    assert counts == {"same": 2, "changed": 0, "added": 0, "removed": 0}
+    new[1]["text"] = "gamma DELTA. Epsilon zeta."
+    rows, counts, _ = cd.diff_items_flow(old, new)
+    assert counts["changed"] == 1 and '<span class="added">DELTA.</span>' in rows[1][1]
+
+
+# ----- end to end with real PDFs made by LibreOffice from Word files -----
+
+SOFFICE = shutil.which("soffice") or shutil.which("libreoffice")
+
+
+def to_pdf(paths, outdir):
+    subprocess.run([SOFFICE, "--headless", "--convert-to", "pdf", "--outdir", str(outdir), *map(str, paths)],
+                   check=True, capture_output=True, timeout=300)
+    return [str(outdir / (os.path.splitext(os.path.basename(p))[0] + ".pdf")) for p in paths]
+
+
+def spec(version):
+    """A requirement document with titles, auto-numbered lists, a table, a figure and header/footer."""
+    def build(doc):
+        sec = doc.sections[0]
+        sec.header.paragraphs[0].text = "ACME Requirement Specification Rev " + "AB"[version - 1]
+        sec.footer.paragraphs[0].text = "Company confidential"
+        doc.add_heading("System Requirements", 0)
+        for ch in range(1, 4):
+            title = "Diagnostics" if ch == 2 else f"Chapter {ch}"
+            if ch == 2 and version == 2:
+                title = "Diagnostics and logging"
+            doc.add_heading(title, 1)
+            for k in range(1, 5):
+                n = (ch - 1) * 4 + k
+                if version == 2 and n == 6:
+                    continue
+                doc.add_paragraph(f"Requirement Number {n}")
+                text = ("The unit shall monitor the supply voltage and report any deviation outside the "
+                        "permitted band to the supervisory system within the agreed response time. ") * (1 + n % 3)
+                if version == 2 and n == 3:
+                    text = text.replace("agreed response time", "response time of 200 ms", 1)
+                doc.add_paragraph(text.strip())
+                if n % 4 == 0:
+                    for item in ("Over-voltage", "Under-voltage" if not (version == 2 and n == 8) else "Brown-out"):
+                        doc.add_paragraph(item, style="List Number")
+                if n == 5:
+                    t = doc.add_table(rows=2, cols=2)
+                    t.style = "Table Grid"
+                    for i, (a, b) in enumerate([("Timeout", "30 s"), ("Retries", "3" if version == 1 else "5")]):
+                        t.cell(i, 0).text, t.cell(i, 1).text = a, b
+                if n == 7:
+                    doc.add_paragraph().add_run().add_picture(
+                        io.BytesIO(encoded(figure("Pump P-101" if version == 1 else "Pump P-102"))["bytes"]),
+                        width=Inches(3))
+        if version == 2:
+            doc.add_paragraph("Requirement Number 13")
+            doc.add_paragraph("All events shall be logged.")
+    return build
+
+
+@pytest.fixture(scope="module")
+def spec_files(tmp_path_factory):
+    if not SOFFICE:
+        pytest.skip("LibreOffice not installed")
+    d = tmp_path_factory.mktemp("spec")
+    docx = [make(d, "v1.docx", spec(1)), make(d, "v2.docx", spec(2))]
+    return dict(zip(["v1.docx", "v2.docx", "v1.pdf", "v2.pdf"], docx + to_pdf(docx, d)))
+
+
+def change_list(out):
+    page = open(out, encoding="utf-8").read()
+    return re.findall(r'<li><a href="#req-\d+"><span class="badge badge-\w+">([^<]+)</span>'
+                      r'(?:<span class="title-tag">Title</span>)?([^<]+)</a>', page)
+
+
+@pytest.mark.parametrize("a, b", [("v1.docx", "v1.pdf"), ("v1.pdf", "v1.docx"), ("v2.docx", "v2.pdf")])
+def test_word_vs_its_own_pdf_has_no_changes(spec_files, tmp_path, a, b):
+    out = str(tmp_path / "r.html")
+    s, _ = cd.run_comparison(spec_files[a], spec_files[b], out)
+    assert change_list(out) == []
+    assert s["req_changed"] == s["req_added"] == s["req_removed"] == 0
+    assert s["img_added"] == s["img_removed"] == 0
+
+
+@pytest.mark.parametrize("a, b", [("v1.docx", "v2.docx"), ("v1.docx", "v2.pdf"),
+                                  ("v1.pdf", "v2.docx"), ("v1.pdf", "v2.pdf")])
+def test_all_format_combinations_find_the_same_changes(spec_files, tmp_path, a, b):
+    out = str(tmp_path / "r.html")
+    s, _ = cd.run_comparison(spec_files[a], spec_files[b], out)
+    assert change_list(out) == [
+        ("Changed", "Requirement Number 3"),
+        ("Changed", "Diagnostics and logging"),
+        ("Changed", "Requirement Number 5"),
+        ("Removed", "Requirement Number 6"),
+        ("Changed", "Requirement Number 7"),
+        ("Changed", "Requirement Number 8"),
+        ("New", "Requirement Number 13"),
+    ]
+    assert (s["img_added"], s["img_removed"]) == (1, 1)

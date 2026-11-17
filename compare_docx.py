@@ -3,11 +3,13 @@ compare_docx.py
 
 A simple point-and-click window for comparing two Word (.docx) files.
 Pick the old file, pick the new file, choose where to save the report,
-and click Compare. No command line needed.
+and click Compare. No command line needed. Each file can be a Word
+(.docx) file or a PDF, so Word-vs-Word, PDF-vs-PDF and Word-vs-PDF all work.
 
 Text is compared word-by-word, and images are shown inline and matched
 by their actual content. The window is built with tkinter, which comes
-built into Python; the only extra package needed is python-docx.
+built into Python. Extra packages: python-docx (always), pillow
+(recommended, for comparing figures) and pymupdf (only for PDF files).
 
 Usage:
     python compare_docx.py
@@ -20,6 +22,7 @@ import html
 import io
 import os
 import pathlib
+import re
 import string
 import threading
 import webbrowser
@@ -33,9 +36,17 @@ from docx import Document
 from docx.oxml.ns import qn
 
 try:  # Optional: lets pictures be compared by what they look like.
-    from PIL import Image
+    from PIL import Image, ImageChops
 except ImportError:
     Image = None
+
+try:  # Optional: needed only for comparing PDF files.
+    import pymupdf
+except ImportError:
+    try:
+        import fitz as pymupdf  # older PyMuPDF versions
+    except ImportError:
+        pymupdf = None
 
 
 # ===========================================================================
@@ -251,6 +262,372 @@ def list_media_files(path):
         return {n for n in z.namelist() if n.startswith("word/media/") and not n.endswith("/")}
 
 
+# ===========================================================================
+# PDF files
+# ===========================================================================
+#
+# A PDF doesn't store paragraphs, headings or "this is a header" -- only
+# positioned lines of text and pictures. The functions below rebuild
+# paragraphs from the line layout, recognise titles by their larger font,
+# and drop page headers/footers (text repeated at the top/bottom of pages,
+# and page numbers) so they don't show up as differences.
+
+# Top/bottom share of each page that is searched for headers and footers.
+PDF_MARGIN_SHARE = 0.09
+# A paragraph whose font is at least this many points larger than the
+# body text is treated as a title.
+PDF_HEADING_EXTRA_PT = 0.9
+
+# A list/heading number or bullet ("1.", "3.2", "a)", "iv.", "•", ...).
+_MARKER = (r"(?:[•●▪■◦○·◆►✓\-–—*\uf000-\uf0ff]|\(?\d+(?:\.\d+)*[.)]?"
+           r"|\(?[A-Za-z][.)]|\(?[ivxlcIVXLC]+[.)])")
+_MARKER_ONLY = re.compile(_MARKER)
+# A PDF line that begins with such a marker starts a new paragraph.
+_LIST_START = re.compile(r"^\s*" + _MARKER + r"(?:\s|$)")
+_PAGE_NUMBER = re.compile(r"(?:-\s*)?(?:page|p\.|sayfa|seite)?\s*#\s*(?:(?:of|/|von|de|-)\s*#)?(?:\s*-)?")
+_DOT_LEADER = re.compile(r"\s*(?:\.\s*){4,}|\s*(?:…\s*){2,}")
+_TERMINAL = (".", ":", ";", "!", "?")
+
+
+def is_pdf(path):
+    """True if the file is a PDF (checked by its content, not just its name)."""
+    with open(path, "rb") as f:
+        return f.read(5) == b"%PDF-"
+
+
+def _pdf_image(block, page_number, index):
+    """Turn a PDF image block into an image dict like the ones from Word files."""
+    data, ext = block["image"], (block.get("ext") or "png").lower()
+    mask = block.get("mask")
+    if Image is not None and (mask or ext not in ("png", "jpeg", "jpg", "gif", "bmp")):
+        # Re-apply the transparency mask (stored separately in PDFs), and
+        # convert formats browsers can't show (JPEG 2000, JBIG2, ...) to PNG.
+        try:
+            with Image.open(io.BytesIO(data)) as im:
+                im.load()
+                if mask:
+                    with Image.open(io.BytesIO(mask)) as m:
+                        alpha = m.convert("L")
+                        if alpha.size != im.size:
+                            alpha = alpha.resize(im.size)
+                    im = im.convert("RGB")
+                    im.putalpha(alpha)
+                out = io.BytesIO()
+                im.save(out, "PNG")
+                data, ext = out.getvalue(), "png"
+        except Exception:
+            pass
+    name = f"page{page_number + 1}-image{index}.{ext}"
+    return {"filename": name, "partname": name, "bytes": data,
+            "hash": image_fingerprint(data)}
+
+
+def extract_items_pdf(path, split_before=""):
+    """
+    Read a PDF and return paragraph items in the same shape as extract_items():
+        {"text": ..., "heading": bool, "images": [...]}
+
+    Pictures become items of their own (text ""), in reading order.
+    `split_before` (e.g. "Requirement Number") always starts a new paragraph,
+    so a requirement is never glued onto the end of the paragraph above it.
+    """
+    if pymupdf is None:
+        raise RuntimeError(
+            "Comparing PDF files needs the PyMuPDF package.\n"
+            "Install it with:  pip install pymupdf"
+        )
+    name = os.path.basename(path)
+    doc = pymupdf.open(path)
+    try:
+        if doc.needs_pass:
+            raise ValueError(f"{name} is password-protected. Remove the password and try again.")
+
+        flags = (pymupdf.TEXTFLAGS_DICT | pymupdf.TEXT_PRESERVE_IMAGES) & ~pymupdf.TEXT_PRESERVE_LIGATURES
+        pages = []
+        for page in doc:
+            height = page.rect.height
+            elements = []
+            for b in page.get_text("dict", sort=True, flags=flags)["blocks"]:
+                if b["type"] == 1:
+                    x0, y0, x1, y1 = b["bbox"]
+                    if x1 - x0 >= 3 and y1 - y0 >= 3 and b.get("image"):
+                        elements.append({"type": "img", "bbox": b["bbox"], "block": b,
+                                         "key": "i:" + hashlib.md5(b["image"]).hexdigest()})
+                    continue
+                for ln in b["lines"]:
+                    all_spans = ln["spans"]
+                    spans = [s for s in all_spans if s["text"].strip()]
+                    if not spans:
+                        continue
+                    text = "".join(s["text"] for s in all_spans).strip()
+                    size = max(spans, key=lambda s: len(s["text"].strip()))["size"]
+                    element = {
+                        "type": "line", "text": text, "bbox": ln["bbox"], "size": size,
+                        "block": b["number"], "block_bbox": b["bbox"],
+                        "key": "t:" + re.sub(r"\d+", "#", " ".join(text.lower().split())),
+                        "chars": sum(len(s["text"].strip()) for s in spans),
+                    }
+                    # "1.<gap>Item text" in one line: remember the number as a
+                    # possible automatic label (decided below).
+                    first, second = spans[0], spans[1] if len(spans) > 1 else None
+                    if (second is not None and _MARKER_ONLY.fullmatch(first["text"].strip())
+                            and second["bbox"][0] - first["bbox"][2] > 0.4 * first["size"]):
+                        rest_index = all_spans.index(second)
+                        element["label"] = first["text"].strip()
+                        element["rest"] = "".join(s["text"] for s in all_spans[rest_index:]).strip()
+                        element["rest_size"] = second["size"]
+                    elements.append(element)
+            pages.append((height, elements))
+
+        total_chars = sum(e["chars"] for _, els in pages for e in els if e["type"] == "line")
+        if pages and total_chars < 20:
+            raise ValueError(
+                f"{name} has no selectable text - it is probably a scanned PDF.\n"
+                f"This tool needs a PDF with real text (run it through OCR first)."
+            )
+
+        # --- Remove headers and footers --------------------------------
+        def in_margin(el, height):
+            return el["bbox"][3] <= height * PDF_MARGIN_SHARE or el["bbox"][1] >= height * (1 - PDF_MARGIN_SHARE)
+
+        margin_keys = [{e["key"] for e in els if in_margin(e, h)} for h, els in pages]
+        seen_on = Counter(k for keys in margin_keys for k in keys)
+        n_pages = len(pages)
+        repeated = {k for k, c in seen_on.items() if n_pages >= 2 and c >= max(2, (n_pages + 1) // 2)}
+
+        def is_header_footer(el, height):
+            if not in_margin(el, height):
+                return False
+            if el["key"] in repeated:
+                return True
+            return el["type"] == "line" and _PAGE_NUMBER.fullmatch(el["key"][2:]) is not None
+
+        pages = [(h, [e for e in els if not is_header_footer(e, h)]) for h, els in pages]
+
+        # --- Body font size (most text is set in it) -------------------
+        sizes = Counter()
+        for _, els in pages:
+            for e in els:
+                if e["type"] == "line":
+                    sizes[round(e["size"] * 2) / 2] += e["chars"]
+        body_size = sizes.most_common(1)[0][0] if sizes else 0
+
+        # --- Automatic numbering ---------------------------------------
+        # Word doesn't store automatic list/heading numbers and bullets as
+        # text, but they are printed in the PDF -- as a separate piece
+        # before the item's text. Drop those so they don't show up as
+        # differences (and so renumbered lists don't, either). A plain
+        # number like "3" is only treated as a label in front of a title,
+        # so numbers in table columns are kept.
+        def drop_label(marker, following_size):
+            if marker.isdigit():
+                return body_size > 0 and following_size >= body_size + PDF_HEADING_EXTRA_PT
+            return True
+
+        for _, els in pages:
+            for i, e in enumerate(els):
+                if e["type"] != "line":
+                    continue
+                if "label" in e:
+                    if drop_label(e["label"], e["rest_size"]):
+                        e["text"], e["starts"] = e["rest"], True
+                    continue
+                nxt = els[i + 1] if i + 1 < len(els) else None
+                if (nxt is not None and nxt["type"] == "line" and nxt["block"] == e["block"]
+                        and _MARKER_ONLY.fullmatch(e["text"])
+                        and abs(nxt["bbox"][1] - e["bbox"][1]) < 0.5 * (e["bbox"][3] - e["bbox"][1])
+                        and nxt["bbox"][0] - e["bbox"][2] > 0.4 * e["size"]
+                        and drop_label(e["text"], nxt["size"])):
+                    e["drop"] = True
+                    nxt["starts"] = True
+            els[:] = [e for e in els if not e.get("drop")]
+
+        # --- Lines -> paragraphs ----------------------------------------
+        needle = (split_before or "").strip().lower()
+
+        def starts_paragraph(prev, line):
+            if prev is None or line["block"] != prev["block"] or line.get("starts"):
+                return True
+            if abs(line["size"] - prev["size"]) > 0.6:
+                return True
+            px0, py0, px1, py1 = prev["bbox"]
+            lx0, ly0, lx1, ly1 = line["bbox"]
+            height = max(py1 - py0, 1)
+            if abs(ly0 - py0) < 0.5 * height:
+                return False  # same visual line (e.g. text after a tab)
+            if ly0 - py1 > 0.5 * height:
+                return True   # extra space between paragraphs
+            if _LIST_START.match(line["text"]):
+                return True
+            if needle and line["text"].lower().startswith(needle):
+                return True
+            bx0, _, bx1, _ = prev["block_bbox"]
+            short = px1 < bx1 - max(0.12 * (bx1 - bx0), 2 * prev["size"])
+            return short and prev["text"].endswith(_TERMINAL)
+
+        paragraphs = []   # {"lines": [...]} or {"image": img}
+        image_count = 0
+        for page_number, (_, els) in enumerate(pages):
+            prev = None
+            for e in els:
+                if e["type"] == "img":
+                    image_count += 1
+                    paragraphs.append({"image": _pdf_image(e["block"], page_number, image_count)})
+                    prev = None
+                    continue
+                if (prev is None and not e.get("starts") and paragraphs and "lines" in paragraphs[-1]
+                        and paragraphs[-1]["page"] == page_number - 1):
+                    # First line on a page: continue the last paragraph of the
+                    # previous page if that one clearly stopped mid-sentence.
+                    last = paragraphs[-1]["lines"][-1]
+                    if (abs(last["size"] - e["size"]) <= 0.6
+                            and not last["text"].endswith(_TERMINAL)
+                            and e["text"][:1].islower()):
+                        paragraphs[-1]["lines"].append(e)
+                        paragraphs[-1]["page"] = page_number
+                        prev = e
+                        continue
+                if starts_paragraph(prev, e):
+                    paragraphs.append({"lines": [e], "page": page_number})
+                else:
+                    paragraphs[-1]["lines"].append(e)
+                prev = e
+
+        items = []
+        for p in paragraphs:
+            if "image" in p:
+                items.append({"text": "", "heading": False, "images": [p["image"]]})
+                continue
+            text = ""
+            for ln in p["lines"]:
+                t = ln["text"]
+                if text.endswith("-") and t[:1].islower():
+                    text += t           # word broken with a hyphen at line end
+                elif text:
+                    text += " " + t
+                else:
+                    text = t
+            text = _DOT_LEADER.sub(" ", text).strip()  # table-of-contents dots
+            if not text:
+                continue
+            para_sizes = Counter()
+            for ln in p["lines"]:
+                para_sizes[ln["size"]] += ln["chars"]
+            size = para_sizes.most_common(1)[0][0]
+            heading = (body_size > 0 and size >= body_size + PDF_HEADING_EXTRA_PT
+                       and len(p["lines"]) <= 3 and len(text) <= 200)
+            items.append({"text": text, "heading": heading, "images": []})
+        return items
+    finally:
+        doc.close()
+
+
+def image_thumbnail(data):
+    """A tiny greyscale version of a picture, for 'does it look the same?' checks."""
+    if Image is None:
+        return None
+    try:
+        with Image.open(io.BytesIO(data)) as im:
+            im = im.convert("RGBA")
+            flat = Image.new("RGBA", im.size, "white")
+            flat.alpha_composite(im)
+            return (im.size[0] / max(im.size[1], 1),
+                    flat.convert("L").resize((32, 32), Image.Resampling.BOX).tobytes())
+    except Exception:
+        return None
+
+
+def _flat_grey(data):
+    """Decode a picture to greyscale, with transparent areas shown as white."""
+    with Image.open(io.BytesIO(data)) as im:
+        im = im.convert("RGBA")
+        flat = Image.new("RGBA", im.size, "white")
+        flat.alpha_composite(im)
+        return flat.convert("L")
+
+
+def compare_by_appearance(old_img, new_img, old_thumb, new_thumb):
+    """
+    Decide whether two pictures that aren't pixel-identical show the same
+    figure. Returns:
+      "resaved"  same size, only compression noise differs (a changed
+                 label, line or box is still caught, even a single character)
+      "resized"  one is a smaller copy; it looks the same, but small details
+                 (e.g. one changed character in a tiny label) can't be verified
+      None       the pictures are different
+    """
+    if old_thumb is None or new_thumb is None:
+        return None
+    (ratio_a, pix_a), (ratio_b, pix_b) = old_thumb, new_thumb
+    if abs(ratio_a - ratio_b) > 0.03 * max(ratio_a, ratio_b):
+        return None
+    diffs = [abs(x - y) for x, y in zip(pix_a, pix_b)]
+    if max(diffs) > 48 or sum(diffs) / len(diffs) > 3.0:
+        return None  # clearly a different picture
+    try:
+        a, b = _flat_grey(old_img["bytes"]), _flat_grey(new_img["bytes"])
+    except Exception:
+        return None
+    if a.size != b.size:
+        return "resized"
+    # Same size: any pixel that differs strongly is a real edit, not noise.
+    strong = ImageChops.difference(a, b).point(lambda v: 255 if v > 96 else 0)
+    return "resaved" if strong.getbbox() is None else None
+
+
+def match_similar_images(items1, items2):
+    """
+    For PDF comparisons: a picture in the new file that isn't pixel-identical
+    to one in the old file but shows the same figure (re-compressed or scaled
+    down when the PDF was made) is given the old picture's fingerprint, so it
+    counts as unchanged. It is marked in the report with how it was matched.
+    """
+    if Image is None:
+        return
+    old_imgs = [img for it in items1 for img in it["images"]]
+    new_imgs = [img for it in items2 for img in it["images"]]
+    old_hashes = {img["hash"] for img in old_imgs}
+    new_hashes = {img["hash"] for img in new_imgs}
+
+    candidates = {}
+    for img in old_imgs:
+        if img["hash"] not in new_hashes and img["hash"] not in candidates:
+            candidates[img["hash"]] = (img, image_thumbnail(img["bytes"]))
+
+    remap, taken = {}, set()
+    for img in new_imgs:
+        h = img["hash"]
+        if h in old_hashes or h in remap:
+            continue
+        remap[h] = None
+        thumb = image_thumbnail(img["bytes"])
+        best = None
+        for old_hash, (old_img, old_thumb) in candidates.items():
+            if old_hash in taken:
+                continue
+            how = compare_by_appearance(old_img, img, old_thumb, thumb)
+            if how == "resaved":
+                best = (old_hash, how)
+                break
+            if how == "resized" and best is None:
+                best = (old_hash, how)
+        if best:
+            remap[h] = best
+            taken.add(best[0])
+    old_by_hash = {img["hash"]: img for img in old_imgs}
+    for img in new_imgs:
+        if remap.get(img["hash"]):
+            img["hash"], img["match"] = remap[img["hash"]]
+            img["old"] = old_by_hash[img["hash"]]
+
+
+def load_document(path, split_before=""):
+    """Read a .docx or .pdf file into paragraph items."""
+    if is_pdf(path):
+        return extract_items_pdf(path, split_before)
+    return extract_items(path)
+
+
 def guess_mime(filename):
     """Pick an image MIME type from the file extension, for embedding in HTML."""
     ext = filename.lower().rsplit(".", 1)[-1]
@@ -271,12 +648,34 @@ def to_data_uri(filename, data):
     return f"data:{guess_mime(filename)};base64,{encoded}"
 
 
+APPROX_IMAGE_LABELS = {
+    "resaved": "Unchanged (re-saved copy, checked pixel by pixel)",
+    "resized": "Looks unchanged — smaller copy, please check small details",
+}
+
+
 def image_html(img, status):
     """Render one image as an HTML card, tagged with its status (same/added/removed)."""
     label = {"same": "", "added": "New", "removed": "Removed"}[status]
+    extra = ""
+    if status == "same" and img.get("match"):
+        label = APPROX_IMAGE_LABELS[img["match"]]
+        extra = f" img-{img['match']}"
     badge = f'<div class="img-badge">{label}</div>' if label else ""
+    if status == "same" and img.get("match") == "resized" and img.get("old"):
+        # Show the old figure next to the new one so it can be checked by eye.
+        return f"""
+      <div class="img-inline img-same img-resized">
+        {badge}
+        <div class="img-pair">
+          <div><div class="img-caption">Old version</div>
+            <img src="{to_data_uri(img['old']['filename'], img['old']['bytes'])}"></div>
+          <div><div class="img-caption">New version (smaller copy)</div>
+            <img src="{to_data_uri(img['filename'], img['bytes'])}"></div>
+        </div>
+      </div>"""
     return f"""
-      <div class="img-inline img-{status}">
+      <div class="img-inline img-{status}{extra}">
         {badge}
         <img src="{to_data_uri(img['filename'], img['bytes'])}">
       </div>"""
@@ -471,6 +870,93 @@ def diff_items(items1, items2):
                     add_single(new_it, "added")
                 else:
                     add_pair(old_it, new_it)
+
+    return rows, counts, img_counts
+
+
+def _flow_tokens(items):
+    """Words and pictures of some paragraphs as one stream: (kind, key, starts_paragraph, image)."""
+    tokens = []
+    for it in items:
+        start = True
+        for word in it["text"].split():
+            tokens.append(("w", word, start, None))
+            start = False
+        for img in it["images"]:
+            tokens.append(("i", img["hash"], start, img))
+            start = False
+    return tokens
+
+
+def diff_items_flow(items1, items2):
+    """
+    Like diff_items(), but ignores where paragraphs are split. Used whenever
+    a PDF is involved: a PDF can break one Word paragraph into two (or join
+    two), and that alone shouldn't be reported as a change. Only wording,
+    order and pictures count. Rows follow the new file's paragraphs.
+    """
+    rows = []
+    counts = {"same": 0, "changed": 0, "added": 0, "removed": 0}
+    img_counts = {"same": 0, "added": 0, "removed": 0}
+
+    def render(row):
+        statuses = {status for status, _ in row}
+        kind = statuses.pop() if len(statuses) == 1 else "changed"
+        parts, words, words_status = [], [], None
+
+        def flush_words():
+            if words:
+                text = html.escape(" ".join(words))
+                parts.append(text if words_status == "same" else f'<span class="{words_status}">{text}</span>')
+                words.clear()
+
+        for status, tok in row:
+            if tok[0] == "w":
+                if status != words_status:
+                    flush_words()
+                    words_status = status
+                words.append(tok[1])
+            else:
+                flush_words()
+                words_status = None
+                parts.append(image_html(tok[3], status))
+                img_counts[status] += 1
+                if status == "same" and tok[3].get("match") == "resized":
+                    img_counts["check"] = img_counts.get("check", 0) + 1
+        flush_words()
+        counts[kind] += 1
+        rows.append((kind, " ".join(parts)))
+
+    def emit(pieces):
+        current = []
+        for status, tok, starts in pieces:
+            if starts and current:
+                render(current)
+                current = []
+            current.append((status, tok))
+        if current:
+            render(current)
+
+    def key(it):
+        return it["text"] + "\x00" + "|".join(img["hash"] for img in it["images"])
+
+    matcher = difflib.SequenceMatcher(None, [key(i) for i in items1], [key(i) for i in items2], autojunk=False)
+    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+        if tag == "equal":
+            emit([("same", t, t[2]) for t in _flow_tokens(items2[j1:j2])])
+            continue
+        old_tokens = _flow_tokens(items1[i1:i2])
+        new_tokens = _flow_tokens(items2[j1:j2])
+        words = difflib.SequenceMatcher(None, [t[:2] for t in old_tokens],
+                                        [t[:2] for t in new_tokens], autojunk=False)
+        pieces = []
+        for op, a1, a2, b1, b2 in words.get_opcodes():
+            if op == "equal":
+                pieces += [("same", t, t[2]) for t in new_tokens[b1:b2]]
+            else:
+                pieces += [("removed", t, t[2]) for t in old_tokens[a1:a2]]
+                pieces += [("added", t, t[2]) for t in new_tokens[b1:b2]]
+        emit(pieces)
 
     return rows, counts, img_counts
 
@@ -687,7 +1173,7 @@ def match_requirements(old_secs, new_secs):
 
 STATUS_LABELS = {
     "same": "Unchanged", "changed": "Changed", "added": "New",
-    "removed": "Removed", "renumbered": "Renumbered",
+    "removed": "Removed", "renumbered": "Renumbered", "check": "Check figure",
 }
 
 PAGE_TEMPLATE = string.Template("""<!DOCTYPE html>
@@ -721,6 +1207,12 @@ PAGE_TEMPLATE = string.Template("""<!DOCTYPE html>
   .img-added .img-badge { color: #14532d; }
   .img-removed { border-color: #e53935; opacity: 0.7; }
   .img-removed .img-badge { color: #7f1d1d; }
+  .img-resaved { border-color: #3b6fd4; }
+  .img-resaved .img-badge { color: #1e3a8a; }
+  .img-resized { border: 2px dashed #b45309; }
+  .img-resized .img-badge { color: #92400e; }
+  .img-pair { display: flex; gap: 12px; flex-wrap: wrap; }
+  .img-caption { font-size: 11px; color: #555; margin-bottom: 2px; }
 
   /* Requirement view */
   .badge { display: inline-block; min-width: 86px; text-align: center; font-size: 12px;
@@ -731,6 +1223,7 @@ PAGE_TEMPLATE = string.Template("""<!DOCTYPE html>
   .badge-added { background: #c6f6c6; color: #14532d; }
   .badge-removed { background: #f8c6c6; color: #7f1d1d; }
   .badge-renumbered { background: #d6e4ff; color: #1e3a8a; }
+  .badge-check { background: #fff; color: #92400e; border: 1px dashed #b45309; }
   .req { border: 1px solid #ddd; border-left-width: 6px; border-radius: 6px;
          margin: 10px 0; padding: 0 10px; }
   .req > summary { cursor: pointer; padding: 8px 0; font-weight: bold; }
@@ -740,6 +1233,7 @@ PAGE_TEMPLATE = string.Template("""<!DOCTYPE html>
   .req-added { border-left-color: #4caf50; }
   .req-removed { border-left-color: #e53935; }
   .req-renumbered { border-left-color: #3b6fd4; }
+  .req-check { border-left-color: #b45309; border-left-style: dashed; }
   .kind-title { background: #f3f4f6; margin-top: 22px; }
   .kind-title > summary { font-size: 17px; }
   .title-tag { font-size: 11px; font-weight: bold; text-transform: uppercase; color: #555;
@@ -767,9 +1261,13 @@ PAGE_TEMPLATE = string.Template("""<!DOCTYPE html>
 </html>""")
 
 
-def build_report(items1, items2, name1, name2, requirement_prefix=DEFAULT_REQUIREMENT_PREFIX):
+def build_report(items1, items2, name1, name2, requirement_prefix=DEFAULT_REQUIREMENT_PREFIX,
+                 flow=False, notes=()):
     """
     Compare two documents and return (html_string, summary_counts).
+
+    flow=True ignores paragraph breaks (used when a PDF is involved), and
+    `notes` are extra lines shown at the top of the report.
 
     If paragraphs starting with `requirement_prefix` are found, the report is
     organised requirement by requirement. Otherwise (or if the prefix is
@@ -785,8 +1283,9 @@ def build_report(items1, items2, name1, name2, requirement_prefix=DEFAULT_REQUIR
         "img_same": 0, "img_added": 0, "img_removed": 0,
         "req_mode": req_mode,
         "req_same": 0, "req_changed": 0, "req_added": 0,
-        "req_removed": 0, "req_renumbered": 0,
+        "req_removed": 0, "req_renumbered": 0, "req_check": 0, "title_check": 0,
         "title_same": 0, "title_changed": 0, "title_added": 0, "title_removed": 0,
+        "img_check": 0,
     }
 
     def tally(counts, img_counts):
@@ -794,15 +1293,28 @@ def build_report(items1, items2, name1, name2, requirement_prefix=DEFAULT_REQUIR
             summary[k] += counts[k]
         for k in ("same", "added", "removed"):
             summary["img_" + k] += img_counts[k]
+        summary["img_check"] += img_counts.get("check", 0)
+
+    diff = diff_items_flow if flow else diff_items
+    notes_html = "".join(f"<i>{html.escape(n)}</i><br>\n    " for n in notes)
 
     paragraph_lines = (
-        f"Paragraphs — unchanged: {{same}}, changed: {{changed}}, "
-        f"added: {{added}}, removed: {{removed}}<br>\n    "
-        f"Images — unchanged: {{img_same}}, added: {{img_added}}, removed: {{img_removed}}"
+        "Paragraphs — unchanged: {same}, changed: {changed}, "
+        "added: {added}, removed: {removed}<br>\n    "
+        "Images — unchanged: {img_same}, added: {img_added}, removed: {img_removed}"
+        "{img_check_note}"
     )
 
+    def finish_summary():
+        summary_text = dict(summary)
+        summary_text["img_check_note"] = (
+            f" — <b>{summary['img_check']} unchanged-looking figure(s) are smaller copies; "
+            f"please check their details</b> (marked with a dashed border)"
+            if summary["img_check"] else "")
+        return summary_text
+
     if not req_mode:
-        rows, counts, img_counts = diff_items(items1, items2)
+        rows, counts, img_counts = diff(items1, items2)
         tally(counts, img_counts)
         note = ""
         if prefix:
@@ -810,7 +1322,7 @@ def build_report(items1, items2, name1, name2, requirement_prefix=DEFAULT_REQUIR
                     f"so this is a plain paragraph-by-paragraph comparison.<br>\n    ")
         page = PAGE_TEMPLATE.substitute(
             name1=html.escape(name1), name2=html.escape(name2),
-            summary_lines=note + paragraph_lines.format(**summary),
+            summary_lines=notes_html + note + paragraph_lines.format(**finish_summary()),
             body=rows_html(rows),
         )
         return page, summary
@@ -819,8 +1331,8 @@ def build_report(items1, items2, name1, name2, requirement_prefix=DEFAULT_REQUIR
     index = []
     for n, entry in enumerate(match_requirements(secs1, secs2)):
         old, new = entry["old"], entry["new"]
-        rows, counts, img_counts = diff_items(old["items"] if old else [],
-                                              new["items"] if new else [])
+        rows, counts, img_counts = diff(old["items"] if old else [],
+                                        new["items"] if new else [])
         tally(counts, img_counts)
         edited_rows = sum(1 for kind, _ in rows if kind != "same")
 
@@ -837,6 +1349,10 @@ def build_report(items1, items2, name1, name2, requirement_prefix=DEFAULT_REQUIR
             note = f"was {old['name']}{extra}"
         else:
             status = "same" if edited_rows == 0 else "changed"
+            if status == "same" and img_counts.get("check"):
+                # Text identical, but a figure could only be compared as a
+                # smaller copy: list it so someone looks at it.
+                status = "check"
 
         sec = new or old
         if sec["kind"] == "req":
@@ -877,14 +1393,17 @@ def build_report(items1, items2, name1, name2, requirement_prefix=DEFAULT_REQUIR
         "Requirements — unchanged: {req_same}, changed: {req_changed}, "
         "new: {req_added}, removed: {req_removed}, renumbered: {req_renumbered}<br>\n    "
     )
-    if any(summary["title_" + k] for k in ("same", "changed", "added", "removed")):
+    if summary["req_check"]:
+        requirement_line = requirement_line.replace(
+            "<br>", ", <b>figure to check: {req_check}</b><br>", 1)
+    if any(summary["title_" + k] for k in ("same", "changed", "added", "removed", "check")):
         requirement_line += (
             "Titles — unchanged: {title_same}, changed: {title_changed}, "
             "new: {title_added}, removed: {title_removed}<br>\n    "
         )
     page = PAGE_TEMPLATE.substitute(
         name1=html.escape(name1), name2=html.escape(name2),
-        summary_lines=(requirement_line + paragraph_lines).format(**summary) + controls,
+        summary_lines=notes_html + (requirement_line + paragraph_lines).format(**finish_summary()) + controls,
         body=index_html + "\n" + "\n".join(cards),
     )
     return page, summary
@@ -893,38 +1412,75 @@ def build_report(items1, items2, name1, name2, requirement_prefix=DEFAULT_REQUIR
 def run_comparison(file1, file2, output_path, requirement_prefix=DEFAULT_REQUIREMENT_PREFIX):
     """
     Do the full comparison and write the HTML report to output_path.
+    Each file may be a Word (.docx) file or a PDF.
     Returns (summary_dict, diagnostic_message_or_None).
     """
-    items1 = extract_items(file1)
-    items2 = extract_items(file2)
+    pdf1, pdf2 = is_pdf(file1), is_pdf(file2)
+    items1 = load_document(file1, requirement_prefix)
+    items2 = load_document(file2, requirement_prefix)
+
+    notes = []
+    if pdf1 or pdf2:
+        notes.append(
+            "A PDF is involved, so where paragraphs and lines break is ignored: only the "
+            "wording, its order and the figures are compared. Page headers, footers, "
+            "page numbers and automatic list/heading numbers are left out (Word doesn't "
+            "store automatic numbers as text either). A figure that was re-saved when the PDF "
+            "was made counts as unchanged if it shows the same picture; such figures are marked."
+        )
+    if pdf1 != pdf2:
+        # Vector drawings (EMF/WMF) in Word become lines in a PDF, not pictures,
+        # so they can't be compared; leave them out instead of calling them removed.
+        word_items = items2 if pdf1 else items1
+        skipped = 0
+        for it in word_items:
+            keep = [img for img in it["images"] if image_thumbnail(img["bytes"]) is not None]
+            skipped += len(it["images"]) - len(keep)
+            it["images"] = keep
+        word_items[:] = [it for it in word_items if it["text"] or it["images"]]
+        if skipped:
+            notes.append(
+                f"{skipped} figure(s) in the Word file are vector drawings (EMF/WMF) that "
+                f"can't be compared with a PDF; they were left out."
+            )
+    if pdf1 or pdf2:
+        match_similar_images(items1, items2)
 
     page, summary = build_report(
         items1, items2, os.path.basename(file1), os.path.basename(file2),
-        requirement_prefix,
+        requirement_prefix, flow=pdf1 or pdf2, notes=notes,
     )
 
     with open(output_path, "w", encoding="utf-8") as f:
         f.write(page)
 
-    # Diagnostic: warn if some image files inside the .docx never showed up
+    # Diagnostic: warn if some image files inside a .docx never showed up
     # in the report. (A picture used several times is stored only once, so
     # we compare which files were used, not how many times.)
-    def coverage(path, items):
+    def coverage(path, items, pdf):
+        if pdf:
+            return 0, 0
         on_disk = list_media_files(path)
         used = {img["partname"].lstrip("/") for it in items for img in it["images"]}
         return len(on_disk), len(on_disk & used)
 
-    on_disk1, placed1 = coverage(file1, items1)
-    on_disk2, placed2 = coverage(file2, items2)
+    on_disk1, placed1 = coverage(file1, items1, pdf1)
+    on_disk2, placed2 = coverage(file2, items2, pdf2)
 
     diagnostic = None
-    if placed1 < on_disk1 or placed2 < on_disk2:
+    if (placed1 < on_disk1 or placed2 < on_disk2) and not (pdf1 or pdf2):
         diagnostic = (
             f"Note: some images inside the files were not matched to any text.\n"
             f"  {os.path.basename(file1)}: {on_disk1} image file(s) found, {placed1} matched\n"
             f"  {os.path.basename(file2)}: {on_disk2} image file(s) found, {placed2} matched\n"
             f"This usually means those images are in a header/footer\n"
             f"or a format this tool doesn't recognize yet."
+        )
+    elif placed1 < on_disk1 or placed2 < on_disk2:
+        word_file, on_disk, placed = (file1, on_disk1, placed1) if not pdf1 else (file2, on_disk2, placed2)
+        diagnostic = (
+            f"Note: {on_disk - placed} image file(s) in {os.path.basename(word_file)} were not compared\n"
+            f"(header/footer pictures, vector drawings, or a format this tool doesn't recognize)."
         )
 
     return summary, diagnostic
@@ -933,6 +1489,10 @@ def run_comparison(file1, file2, output_path, requirement_prefix=DEFAULT_REQUIRE
 # ===========================================================================
 # GUI
 # ===========================================================================
+
+DOCUMENT_TYPES = [("Word or PDF", "*.docx *.pdf"), ("Word documents", "*.docx"),
+                  ("PDF files", "*.pdf")]
+
 
 class CompareApp:
     def __init__(self, root):
@@ -946,13 +1506,13 @@ class CompareApp:
         frame.grid(row=0, column=0, sticky="nsew")
 
         # --- Old file ---
-        ttk.Label(frame, text="Old / original file:").grid(row=0, column=0, sticky="w", **padding)
+        ttk.Label(frame, text="Old / original file (.docx or .pdf):").grid(row=0, column=0, sticky="w", **padding)
         self.file1_var = tk.StringVar()
         ttk.Entry(frame, textvariable=self.file1_var, width=55).grid(row=1, column=0, columnspan=2, sticky="we", padx=10)
         ttk.Button(frame, text="Browse...", command=self.pick_file1).grid(row=1, column=2, padx=10)
 
         # --- New file ---
-        ttk.Label(frame, text="New / updated file:").grid(row=2, column=0, sticky="w", **padding)
+        ttk.Label(frame, text="New / updated file (.docx or .pdf):").grid(row=2, column=0, sticky="w", **padding)
         self.file2_var = tk.StringVar()
         ttk.Entry(frame, textvariable=self.file2_var, width=55).grid(row=3, column=0, columnspan=2, sticky="we", padx=10)
         ttk.Button(frame, text="Browse...", command=self.pick_file2).grid(row=3, column=2, padx=10)
@@ -986,12 +1546,12 @@ class CompareApp:
         self.last_output_path = None
 
     def pick_file1(self):
-        path = filedialog.askopenfilename(title="Choose the old .docx file", filetypes=[("Word documents", "*.docx")])
+        path = filedialog.askopenfilename(title="Choose the old file", filetypes=DOCUMENT_TYPES)
         if path:
             self.file1_var.set(path)
 
     def pick_file2(self):
-        path = filedialog.askopenfilename(title="Choose the new .docx file", filetypes=[("Word documents", "*.docx")])
+        path = filedialog.askopenfilename(title="Choose the new file", filetypes=DOCUMENT_TYPES)
         if path:
             self.file2_var.set(path)
 
@@ -1011,13 +1571,19 @@ class CompareApp:
         output = self.output_var.get().strip()
 
         if not file1 or not file2:
-            messagebox.showerror("Missing file", "Please choose both the old and the new .docx file.")
+            messagebox.showerror("Missing file", "Please choose both the old and the new file (.docx or .pdf).")
             return
         if not os.path.isfile(file1):
             messagebox.showerror("File not found", f"Can't find this file:\n{file1}")
             return
         if not os.path.isfile(file2):
             messagebox.showerror("File not found", f"Can't find this file:\n{file2}")
+            return
+        if pymupdf is None and (is_pdf(file1) or is_pdf(file2)):
+            messagebox.showerror(
+                "PDF support not installed",
+                "Comparing PDF files needs the PyMuPDF package.\n\n"
+                "Install it with:  pip install pymupdf")
             return
         if not output:
             messagebox.showerror("Missing output name", "Please enter a name for the output HTML file.")
@@ -1064,6 +1630,10 @@ class CompareApp:
             lines.insert(1, (
                 f"No paragraphs starting with \"{self.prefix_var.get().strip()}\" were found, "
                 f"so a plain comparison was made."))
+        if summary.get("img_check"):
+            lines.append(
+                f"{summary['img_check']} figure(s) look unchanged but are smaller copies in the PDF - "
+                f"please check them in the report (dashed border).")
         if diagnostic:
             lines.append("")
             lines.append(diagnostic)
