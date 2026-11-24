@@ -912,3 +912,155 @@ def test_all_format_combinations_find_the_same_changes(spec_files, tmp_path, a, 
         ("New", "Requirement Number 13"),
     ]
     assert (s["img_added"], s["img_removed"]) == (1, 1)
+
+
+# ---------- old Word (.doc) files ----------
+
+import sys
+import types
+
+
+def test_is_legacy_word(tmp_path):
+    docx_file = make(tmp_path, "a.docx", paras("x"))
+    pdf_file = make_pdf(tmp_path, "a.pdf", [[("Hello world here", 11)]])
+    ole = tmp_path / "a.doc"
+    ole.write_bytes(cd.OLE_MAGIC + b"\0" * 100)
+    rtf = tmp_path / "a.txt"
+    rtf.write_bytes(b"{\\rtf1 hello}")
+    misnamed = tmp_path / "really_docx.doc"
+    misnamed.write_bytes(open(docx_file, "rb").read())
+    assert not cd.is_legacy_word(docx_file) and not cd.is_legacy_word(pdf_file)
+    assert cd.is_legacy_word(str(ole)) and cd.is_legacy_word(str(rtf))
+    assert not cd.is_legacy_word(str(misnamed))  # content wins over the name
+
+
+def test_no_converter_gives_save_as_advice(tmp_path, monkeypatch):
+    doc = tmp_path / "old.doc"
+    doc.write_bytes(cd.OLE_MAGIC + b"\0" * 100)
+    monkeypatch.setattr(cd, "find_libreoffice", lambda: None)
+    with pytest.raises(RuntimeError) as err:
+        cd.convert_to_docx(str(doc), str(tmp_path / "out"), use_word=False)
+    assert "Save As" in str(err.value) and "LibreOffice is not installed" in str(err.value)
+
+
+class FakeWord:
+    """Stands in for Microsoft Word's automation interface (win32com)."""
+
+    def __init__(self, source_docx, fail_open=False):
+        self.calls = []
+        self.source_docx = source_docx
+        self.fail_open = fail_open
+        outer = self
+
+        class Doc:
+            def SaveAs(self, FileName, FileFormat):
+                outer.calls.append(("SaveAs", FileFormat))
+                shutil.copy(outer.source_docx, FileName)
+
+            def Close(self, SaveChanges):
+                outer.calls.append(("Close", SaveChanges))
+
+        class Documents:
+            def Open(self, **kwargs):
+                outer.calls.append(("Open", kwargs))
+                if outer.fail_open:
+                    raise OSError("The file appears to be corrupted")
+                return Doc()
+
+        self.Documents = Documents()
+
+    def Quit(self, SaveChanges):
+        self.calls.append(("Quit", SaveChanges))
+
+
+def install_fake_word(monkeypatch, word):
+    com = types.ModuleType("pythoncom")
+    com.CoInitialize = lambda: word.calls.append(("CoInitialize",))
+    com.CoUninitialize = lambda: word.calls.append(("CoUninitialize",))
+    client = types.ModuleType("win32com.client")
+
+    def dispatch_ex(name):
+        word.calls.append(("DispatchEx", name))
+        return word
+
+    client.DispatchEx = dispatch_ex
+    pkg = types.ModuleType("win32com")
+    pkg.client = client
+    monkeypatch.setitem(sys.modules, "pythoncom", com)
+    monkeypatch.setitem(sys.modules, "win32com", pkg)
+    monkeypatch.setitem(sys.modules, "win32com.client", client)
+
+
+def test_word_conversion_uses_own_hidden_instance_read_only(tmp_path, monkeypatch):
+    source = make(tmp_path, "src.docx", paras("Requirement Number 1", "Converted text."))
+    doc = tmp_path / "old.doc"
+    doc.write_bytes(cd.OLE_MAGIC + b"\0" * 100)
+    word = FakeWord(source)
+    install_fake_word(monkeypatch, word)
+    out, program = cd.convert_to_docx(str(doc), str(tmp_path / "out"), use_word=True)
+    assert program == "Microsoft Word" and out.endswith("old.docx")
+    assert [i["text"] for i in cd.extract_items(out)] == ["Requirement Number 1", "Converted text."]
+    names = [c[0] for c in word.calls]
+    assert names == ["CoInitialize", "DispatchEx", "Open", "SaveAs", "Close", "Quit", "CoUninitialize"]
+    opened = word.calls[2][1]
+    assert opened["ReadOnly"] is True and opened["AddToRecentFiles"] is False
+    assert opened["PasswordDocument"] == ""        # never shows a password prompt
+    assert word.calls[3] == ("SaveAs", 12)          # .docx format
+    assert word.calls[4] == ("Close", 0) and word.calls[5] == ("Quit", 0)  # nothing saved back
+
+
+def test_word_failure_still_closes_word_and_falls_back(tmp_path, monkeypatch):
+    source = make(tmp_path, "src.docx", paras("x"))
+    doc = tmp_path / "old.doc"
+    doc.write_bytes(cd.OLE_MAGIC + b"\0" * 100)
+    word = FakeWord(source, fail_open=True)
+    install_fake_word(monkeypatch, word)
+    monkeypatch.setattr(cd, "find_libreoffice", lambda: None)
+    with pytest.raises(RuntimeError) as err:
+        cd.convert_to_docx(str(doc), str(tmp_path / "out"), use_word=True)
+    assert "Microsoft Word could not convert it (The file appears to be corrupted)" in str(err.value)
+    assert [c[0] for c in word.calls][-2:] == ["Quit", "CoUninitialize"]
+
+
+def test_word_without_pywin32_falls_back_to_libreoffice(tmp_path, monkeypatch):
+    doc = tmp_path / "old.doc"
+    doc.write_bytes(cd.OLE_MAGIC + b"\0" * 100)
+    monkeypatch.setitem(sys.modules, "pythoncom", None)  # import fails
+    monkeypatch.setattr(cd, "find_libreoffice", lambda: None)
+    with pytest.raises(RuntimeError, match="pywin32"):
+        cd.convert_to_docx(str(doc), str(tmp_path / "out"), use_word=True)
+
+
+@pytest.fixture(scope="module")
+def doc_files(spec_files, tmp_path_factory):
+    """The same two specs, saved in the old .doc format by LibreOffice."""
+    d = tmp_path_factory.mktemp("docs")
+    subprocess.run([SOFFICE, "--headless", "--convert-to", "doc", "--outdir", str(d),
+                    spec_files["v1.docx"], spec_files["v2.docx"]],
+                   check=True, capture_output=True, timeout=300)
+    return dict(spec_files, **{"v1.doc": str(d / "v1.doc"), "v2.doc": str(d / "v2.doc")})
+
+
+def test_doc_vs_its_own_docx_has_no_changes(doc_files, tmp_path):
+    out = str(tmp_path / "r.html")
+    s, _ = cd.run_comparison(doc_files["v1.doc"], doc_files["v1.docx"], out)
+    assert change_list(out) == []
+    page = open(out, encoding="utf-8").read()
+    assert "Comparing: v1.doc vs v1.docx" in page
+    assert "converted to .docx with LibreOffice" in page
+
+
+@pytest.mark.parametrize("a, b", [("v1.doc", "v2.doc"), ("v1.doc", "v2.docx"),
+                                  ("v1.docx", "v2.doc"), ("v1.doc", "v2.pdf"), ("v1.pdf", "v2.doc")])
+def test_doc_combinations_find_the_same_changes(doc_files, tmp_path, a, b):
+    out = str(tmp_path / "r.html")
+    s, _ = cd.run_comparison(doc_files[a], doc_files[b], out)
+    assert change_list(out) == [
+        ("Changed", "Requirement Number 3"),
+        ("Changed", "Diagnostics and logging"),
+        ("Changed", "Requirement Number 5"),
+        ("Removed", "Requirement Number 6"),
+        ("Changed", "Requirement Number 7"),
+        ("Changed", "Requirement Number 8"),
+        ("New", "Requirement Number 13"),
+    ]

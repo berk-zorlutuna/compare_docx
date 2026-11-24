@@ -5,6 +5,8 @@ A simple point-and-click window for comparing two Word (.docx) files.
 Pick the old file, pick the new file, choose where to save the report,
 and click Compare. No command line needed. Each file can be a Word
 (.docx) file or a PDF, so Word-vs-Word, PDF-vs-PDF and Word-vs-PDF all work.
+Old Word 97-2003 (.doc) files are converted to .docx first, using
+Microsoft Word (on Windows, with pywin32) or LibreOffice.
 
 Text is compared word-by-word, and images are shown inline and matched
 by their actual content. The window is built with tkinter, which comes
@@ -23,7 +25,10 @@ import io
 import os
 import pathlib
 import re
+import shutil
 import string
+import subprocess
+import tempfile
 import threading
 import webbrowser
 import zipfile
@@ -619,6 +624,132 @@ def match_similar_images(items1, items2):
         if remap.get(img["hash"]):
             img["hash"], img["match"] = remap[img["hash"]]
             img["old"] = old_by_hash[img["hash"]]
+
+
+# ===========================================================================
+# Old Word (.doc) files
+# ===========================================================================
+#
+# The old Word 97-2003 format (.doc) is a different kind of file that
+# python-docx can't read. Such files are converted to .docx first, with
+# Microsoft Word (Windows, needs the pywin32 package) or LibreOffice.
+
+OLE_MAGIC = b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"   # start of every .doc file
+
+
+def is_legacy_word(path):
+    """
+    True for files that must be converted before comparing: old .doc files
+    (and .rtf / .dot). A password-protected .docx also looks like this from
+    the outside; converting it fails with a clear message.
+    """
+    with open(path, "rb") as f:
+        head = f.read(8)
+    if head.startswith(b"%PDF-") or head.startswith(b"PK"):
+        return False  # PDF, or a normal .docx (a zip file)
+    return (head == OLE_MAGIC or head.startswith(b"{\\rtf")
+            or path.lower().endswith((".doc", ".dot", ".rtf")))
+
+
+def find_libreoffice():
+    """Path of LibreOffice's soffice program, or None if it isn't installed."""
+    for name in ("soffice", "libreoffice"):
+        found = shutil.which(name)
+        if found:
+            return found
+    candidates = []
+    for env in ("ProgramFiles", "ProgramFiles(x86)"):
+        base = os.environ.get(env)
+        if base:
+            candidates.append(os.path.join(base, "LibreOffice", "program", "soffice.exe"))
+    candidates.append("/Applications/LibreOffice.app/Contents/MacOS/soffice")
+    return next((c for c in candidates if os.path.isfile(c)), None)
+
+
+def _docx_name(path, outdir):
+    return os.path.join(os.path.abspath(outdir), os.path.splitext(os.path.basename(path))[0] + ".docx")
+
+
+def _convert_with_word(path, outdir):
+    """Convert with Microsoft Word itself (Windows only, needs pywin32)."""
+    import pythoncom
+    import win32com.client
+
+    out = _docx_name(path, outdir)
+    pythoncom.CoInitialize()  # needed because this runs in a background thread
+    try:
+        # A separate, hidden Word instance: the user's open Word windows are
+        # never touched, and Quit() below only closes this instance.
+        word = win32com.client.DispatchEx("Word.Application")
+        try:
+            word.Visible = False
+            word.DisplayAlerts = 0  # no pop-up questions
+            doc = word.Documents.Open(
+                FileName=os.path.abspath(path), ConfirmConversions=False, ReadOnly=True,
+                AddToRecentFiles=False, PasswordDocument="", Visible=False,
+            )
+            try:
+                doc.SaveAs(FileName=out, FileFormat=12)  # 12 = Word document (.docx)
+            finally:
+                doc.Close(SaveChanges=0)
+        finally:
+            word.Quit(SaveChanges=0)
+    finally:
+        pythoncom.CoUninitialize()
+    if not os.path.isfile(out):
+        raise RuntimeError("Word did not produce a .docx file")
+    return out
+
+
+def _convert_with_libreoffice(soffice, path, outdir):
+    """Convert with LibreOffice in the background."""
+    out = _docx_name(path, outdir)
+    # A private settings folder, so this also works while LibreOffice is open.
+    profile = pathlib.Path(outdir, "libreoffice-profile").absolute().as_uri()
+    result = subprocess.run(
+        [soffice, f"-env:UserInstallation={profile}", "--headless", "--norestore",
+         "--convert-to", "docx", "--outdir", os.path.abspath(outdir), os.path.abspath(path)],
+        capture_output=True, text=True, timeout=300,
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+    )
+    if not os.path.isfile(out):
+        details = (result.stderr or result.stdout or "").strip()
+        raise RuntimeError(details[:300] or "LibreOffice did not produce a .docx file")
+    return out
+
+
+def convert_to_docx(path, outdir, use_word=None):
+    """
+    Convert an old .doc (or .rtf) file to .docx in `outdir`.
+    Returns (path_of_the_docx, name_of_the_program_used).
+    Microsoft Word is tried first on Windows, then LibreOffice.
+    """
+    os.makedirs(outdir, exist_ok=True)
+    if use_word is None:
+        use_word = os.name == "nt"
+    problems = []
+    if use_word:
+        try:
+            return _convert_with_word(path, outdir), "Microsoft Word"
+        except ImportError:
+            problems.append("using Microsoft Word needs the pywin32 package (pip install pywin32)")
+        except Exception as exc:
+            problems.append(f"Microsoft Word could not convert it ({exc})")
+    soffice = find_libreoffice()
+    if soffice:
+        try:
+            return _convert_with_libreoffice(soffice, path, outdir), "LibreOffice"
+        except Exception as exc:
+            problems.append(f"LibreOffice could not convert it ({exc})")
+    else:
+        problems.append("LibreOffice is not installed")
+    raise RuntimeError(
+        f"{os.path.basename(path)} is an old-format Word file (.doc), or a password-protected "
+        f"Word file, which this tool can't read directly, and it could not be converted.\n\n"
+        f"Easiest fix: open it in Word, choose File > Save As > Word Document (.docx), "
+        f"and compare the .docx instead.\n\n"
+        f"Details: " + "; ".join(problems) + "."
+    )
 
 
 def load_document(path, split_before=""):
@@ -1412,14 +1543,32 @@ def build_report(items1, items2, name1, name2, requirement_prefix=DEFAULT_REQUIR
 def run_comparison(file1, file2, output_path, requirement_prefix=DEFAULT_REQUIREMENT_PREFIX):
     """
     Do the full comparison and write the HTML report to output_path.
-    Each file may be a Word (.docx) file or a PDF.
+    Each file may be a Word file (.docx, or old .doc which is converted
+    first) or a PDF.
     Returns (summary_dict, diagnostic_message_or_None).
     """
+    with tempfile.TemporaryDirectory(prefix="compare_docx_") as tmp:
+        notes = []
+        readable = []
+        for tag, path in (("old", file1), ("new", file2)):
+            if is_legacy_word(path):
+                converted, program = convert_to_docx(path, os.path.join(tmp, tag))
+                notes.append(f"{os.path.basename(path)} is an old-format Word file (.doc); "
+                             f"it was converted to .docx with {program} before comparing.")
+                readable.append(converted)
+            else:
+                readable.append(path)
+        return _compare_files(readable[0], readable[1], output_path, requirement_prefix,
+                              os.path.basename(file1), os.path.basename(file2), notes)
+
+
+def _compare_files(file1, file2, output_path, requirement_prefix, name1, name2, notes):
+    """run_comparison() for files that are .docx or PDF."""
     pdf1, pdf2 = is_pdf(file1), is_pdf(file2)
     items1 = load_document(file1, requirement_prefix)
     items2 = load_document(file2, requirement_prefix)
 
-    notes = []
+    notes = list(notes)
     if pdf1 or pdf2:
         notes.append(
             "A PDF is involved, so where paragraphs and lines break is ignored: only the "
@@ -1447,7 +1596,7 @@ def run_comparison(file1, file2, output_path, requirement_prefix=DEFAULT_REQUIRE
         match_similar_images(items1, items2)
 
     page, summary = build_report(
-        items1, items2, os.path.basename(file1), os.path.basename(file2),
+        items1, items2, name1, name2,
         requirement_prefix, flow=pdf1 or pdf2, notes=notes,
     )
 
@@ -1471,15 +1620,15 @@ def run_comparison(file1, file2, output_path, requirement_prefix=DEFAULT_REQUIRE
     if (placed1 < on_disk1 or placed2 < on_disk2) and not (pdf1 or pdf2):
         diagnostic = (
             f"Note: some images inside the files were not matched to any text.\n"
-            f"  {os.path.basename(file1)}: {on_disk1} image file(s) found, {placed1} matched\n"
-            f"  {os.path.basename(file2)}: {on_disk2} image file(s) found, {placed2} matched\n"
+            f"  {name1}: {on_disk1} image file(s) found, {placed1} matched\n"
+            f"  {name2}: {on_disk2} image file(s) found, {placed2} matched\n"
             f"This usually means those images are in a header/footer\n"
             f"or a format this tool doesn't recognize yet."
         )
     elif placed1 < on_disk1 or placed2 < on_disk2:
-        word_file, on_disk, placed = (file1, on_disk1, placed1) if not pdf1 else (file2, on_disk2, placed2)
+        word_name, on_disk, placed = (name1, on_disk1, placed1) if not pdf1 else (name2, on_disk2, placed2)
         diagnostic = (
-            f"Note: {on_disk - placed} image file(s) in {os.path.basename(word_file)} were not compared\n"
+            f"Note: {on_disk - placed} image file(s) in {word_name} were not compared\n"
             f"(header/footer pictures, vector drawings, or a format this tool doesn't recognize)."
         )
 
@@ -1490,7 +1639,7 @@ def run_comparison(file1, file2, output_path, requirement_prefix=DEFAULT_REQUIRE
 # GUI
 # ===========================================================================
 
-DOCUMENT_TYPES = [("Word or PDF", "*.docx *.pdf"), ("Word documents", "*.docx"),
+DOCUMENT_TYPES = [("Word or PDF", "*.docx *.doc *.pdf"), ("Word documents", "*.docx *.doc"),
                   ("PDF files", "*.pdf")]
 
 
@@ -1506,13 +1655,13 @@ class CompareApp:
         frame.grid(row=0, column=0, sticky="nsew")
 
         # --- Old file ---
-        ttk.Label(frame, text="Old / original file (.docx or .pdf):").grid(row=0, column=0, sticky="w", **padding)
+        ttk.Label(frame, text="Old / original file (.docx, .doc or .pdf):").grid(row=0, column=0, sticky="w", **padding)
         self.file1_var = tk.StringVar()
         ttk.Entry(frame, textvariable=self.file1_var, width=55).grid(row=1, column=0, columnspan=2, sticky="we", padx=10)
         ttk.Button(frame, text="Browse...", command=self.pick_file1).grid(row=1, column=2, padx=10)
 
         # --- New file ---
-        ttk.Label(frame, text="New / updated file (.docx or .pdf):").grid(row=2, column=0, sticky="w", **padding)
+        ttk.Label(frame, text="New / updated file (.docx, .doc or .pdf):").grid(row=2, column=0, sticky="w", **padding)
         self.file2_var = tk.StringVar()
         ttk.Entry(frame, textvariable=self.file2_var, width=55).grid(row=3, column=0, columnspan=2, sticky="we", padx=10)
         ttk.Button(frame, text="Browse...", command=self.pick_file2).grid(row=3, column=2, padx=10)
@@ -1571,7 +1720,7 @@ class CompareApp:
         output = self.output_var.get().strip()
 
         if not file1 or not file2:
-            messagebox.showerror("Missing file", "Please choose both the old and the new file (.docx or .pdf).")
+            messagebox.showerror("Missing file", "Please choose both the old and the new file (.docx, .doc or .pdf).")
             return
         if not os.path.isfile(file1):
             messagebox.showerror("File not found", f"Can't find this file:\n{file1}")
@@ -1594,7 +1743,10 @@ class CompareApp:
 
         self.open_btn.grid_remove()
         self.compare_btn.config(state="disabled")
-        self.status_var.set("Comparing... this may take a few seconds for large files.")
+        if is_legacy_word(file1) or is_legacy_word(file2):
+            self.status_var.set("Converting the .doc file(s) and comparing... this can take up to a minute.")
+        else:
+            self.status_var.set("Comparing... this may take a few seconds for large files.")
 
         # Run the comparison in a background thread so the window doesn't freeze.
         threading.Thread(target=self._compare_worker, args=(file1, file2, output, self.prefix_var.get().strip()), daemon=True).start()

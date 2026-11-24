@@ -21,6 +21,20 @@ python compare_docx.py
 
 Pick the old file, the new file, where to save the report, and click Compare.
 
+## Old Word files (.doc)
+
+Word 97-2003 files (`.doc`) are converted to `.docx` automatically before
+comparing, so any mix of `.doc`, `.docx` and PDF works. The conversion uses:
+
+1. Microsoft Word, on Windows, if the `pywin32` package is installed
+   (`pip install pywin32`). Word runs hidden in its own instance, opens the
+   file read-only and never changes it; your open Word windows aren't touched.
+2. Otherwise LibreOffice, if it is installed.
+
+If neither is available, open the file in Word, choose File > Save As >
+Word Document (.docx), and compare the `.docx`. The report notes which files
+were converted and with which program.
+
 ## PDF files
 
 Either file can be a Word file or a PDF, so Word vs Word, PDF vs PDF and
