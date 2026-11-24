@@ -6,7 +6,8 @@ Pick the old file, pick the new file, choose where to save the report,
 and click Compare. No command line needed. Each file can be a Word
 (.docx) file or a PDF, so Word-vs-Word, PDF-vs-PDF and Word-vs-PDF all work.
 Old Word 97-2003 (.doc) files are converted to .docx first, using
-Microsoft Word (on Windows, with pywin32) or LibreOffice.
+Microsoft Word (on Windows, with pywin32) or LibreOffice. HTML pages
+(.html/.htm, and Word's single-file .mht pages) can be compared too.
 
 Text is compared word-by-word, and images are shown inline and matched
 by their actual content. The window is built with tkinter, which comes
@@ -18,7 +19,10 @@ Usage:
 """
 
 import base64
+import codecs
 import difflib
+import email
+import email.policy
 import hashlib
 import html
 import io
@@ -33,6 +37,9 @@ import threading
 import webbrowser
 import zipfile
 from collections import Counter
+from html.parser import HTMLParser
+from urllib.parse import unquote, urljoin
+from urllib.request import url2pathname
 
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
@@ -647,6 +654,8 @@ def is_legacy_word(path):
         head = f.read(8)
     if head.startswith(b"%PDF-") or head.startswith(b"PK"):
         return False  # PDF, or a normal .docx (a zip file)
+    if head != OLE_MAGIC and is_html(path):
+        return False  # a web page, even if it was given a .doc name
     return (head == OLE_MAGIC or head.startswith(b"{\\rtf")
             or path.lower().endswith((".doc", ".dot", ".rtf")))
 
@@ -752,10 +761,304 @@ def convert_to_docx(path, outdir, use_word=None):
     )
 
 
-def load_document(path, split_before=""):
-    """Read a .docx or .pdf file into paragraph items."""
+# ===========================================================================
+# HTML files (.html / .htm, and Word's single-file web pages .mht / .mhtml)
+# ===========================================================================
+
+_HTML_BLOCKS = {
+    "p", "div", "li", "td", "th", "caption", "dt", "dd", "blockquote", "pre",
+    "section", "article", "header", "footer", "main", "aside", "figure", "figcaption",
+    "address", "tr", "table", "ul", "ol", "dl", "body", "form", "fieldset", "legend",
+    "center", "hr", "h1", "h2", "h3", "h4", "h5", "h6", "nav", "details", "summary",
+}
+_HTML_HEADINGS = {"h1", "h2", "h3", "h4", "h5", "h6"}
+# Content of these is never part of the document text.
+_HTML_SKIP = {"script", "style", "head", "noscript", "template", "title", "svg", "math",
+              "object", "iframe", "button", "select", "textarea", "xml"}
+_HTML_VOID = {"br", "img", "hr", "meta", "link", "input", "area", "base", "col", "embed",
+              "param", "source", "track", "wbr"}
+_IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp", ".tif", ".tiff",
+                     ".emf", ".wmf", ".svg")
+_MAX_IMAGE_BYTES = 50 * 1024 * 1024
+
+
+def is_html(path):
+    """True for HTML files and Word's single-file web pages (.mht)."""
+    if path.lower().endswith((".html", ".htm", ".xhtml", ".mht", ".mhtml")):
+        return True
+    with open(path, "rb") as f:
+        head = f.read(2048)
+    head = head.lstrip(codecs.BOM_UTF8).lstrip().lower()
+    if head.startswith((b"<!doctype html", b"<html")):
+        return True
+    if head.startswith(b"<?xml") and b"<html" in head:
+        return True
+    return head.startswith(b"mime-version") and b"multipart/related" in head and b"text/html" in head
+
+
+def _decode_html(raw):
+    """Bytes of an HTML file -> text, using its BOM or <meta charset> (Word often uses windows-1252)."""
+    if raw.startswith(codecs.BOM_UTF8):
+        return raw[3:].decode("utf-8", "replace")
+    if raw.startswith((codecs.BOM_UTF16_LE, codecs.BOM_UTF16_BE)):
+        return raw.decode("utf-16", "replace")
+    m = re.search(rb"""charset\s*=\s*["']?([A-Za-z0-9_.:-]+)""", raw[:4096], re.I)
+    for encoding in ([m.group(1).decode("ascii")] if m else []) + ["utf-8"]:
+        try:
+            return raw.decode(encoding)
+        except (LookupError, UnicodeDecodeError):
+            continue
+    return raw.decode("cp1252", "replace")
+
+
+def _read_mht(raw):
+    """
+    Word's "Single File Web Page" (.mht) is an e-mail-style bundle: the page
+    plus its pictures. Returns (html_text, base_location, {location: bytes}).
+    """
+    msg = email.message_from_bytes(raw, policy=email.policy.default)
+    html_text, base, parts = None, "", {}
+    for part in msg.walk():
+        if part.is_multipart():
+            continue
+        location = (part.get("Content-Location") or "").strip()
+        if part.get_content_type() == "text/html" and html_text is None:
+            payload = part.get_payload(decode=True) or b""
+            charset = part.get_content_charset()
+            try:
+                html_text = payload.decode(charset) if charset else _decode_html(payload)
+            except (LookupError, UnicodeDecodeError):
+                html_text = _decode_html(payload)
+            base = location
+        elif location:
+            parts[location] = part.get_payload(decode=True) or b""
+    if html_text is None:
+        raise ValueError("this .mht file contains no web page")
+    return html_text, base, parts
+
+
+def _is_big_font(tag, attrs, style):
+    """Text set in 14 pt or larger (a title written as a plain paragraph)."""
+    m = re.search(r"font-size:([\d.]+)(pt|px)", style)
+    if m:
+        size = float(m.group(1)) * (0.75 if m.group(2) == "px" else 1.0)
+        return size >= 14
+    if tag == "font":
+        try:
+            return int((attrs.get("size") or "").strip()) >= 5
+        except ValueError:
+            return False
+    return False
+
+
+def _is_page_furniture(tag, attrs, style, classes):
+    """
+    Page headers/footers and footnotes as Word and LibreOffice write them
+    into HTML. They are left out because they aren't compared in .docx
+    files either.
+    """
+    title = (attrs.get("title") or "").lower()
+    ident = (attrs.get("id") or "").lower()
+    return ((tag == "div" and title in ("header", "footer"))                       # LibreOffice
+            or any(k in style for k in ("mso-element:header", "mso-element:footer",   # Word
+                                        "mso-element:footnote", "mso-element:endnote",
+                                        "mso-footnote-id", "mso-endnote-id"))
+            or ident.startswith(("sdfootnote", "sdendnote"))                         # LibreOffice
+            or "sdfootnoteanc" in classes or "sdendnoteanc" in classes)
+
+
+class _HtmlReader(HTMLParser):
+    """Turns HTML into paragraph items: one per block (paragraph, heading, list item, table cell)."""
+
+    def __init__(self, load_image):
+        super().__init__(convert_charrefs=True)
+        self.load_image = load_image
+        self.items = []
+        self.text = []
+        self.images = []
+        self.stack = []          # open tags: (tag, skips, is_heading, is_big)
+        self.skip = 0            # > 0 while inside content that isn't shown
+        self.heading = 0         # > 0 while inside a title/heading
+        self.big = 0             # > 0 while inside large-font text
+        self.para_heading = False
+        self.chars = self.big_chars = 0
+
+    def flush(self):
+        text = " ".join("".join(self.text).split())
+        if text or self.images:
+            big = self.chars > 0 and self.big_chars >= 0.8 * self.chars and len(text) <= 200
+            self.items.append({"text": text, "images": self.images,
+                               "heading": bool(text) and (self.para_heading or big)})
+        self.text, self.images = [], []
+        self.chars = self.big_chars = 0
+
+    def handle_starttag(self, tag, attrs):
+        attrs = dict(attrs)
+        style = (attrs.get("style") or "").replace(" ", "").lower()
+        classes = (attrs.get("class") or "").lower()
+        hidden = ("display:none" in style or "hidden" in attrs
+                  # Word writes automatic list numbers as text inside such spans;
+                  # .docx files don't contain them, so leave them out here too.
+                  or "mso-list:ignore" in style
+                  or _is_page_furniture(tag, attrs, style, classes))
+        if tag == "br":
+            self.text.append("\n")
+            return
+        if tag == "img":
+            if not self.skip and not hidden:
+                img = self.load_image(attrs.get("src") or "")
+                if img is not None:
+                    self.images.append(img)
+            return
+        if tag in _HTML_BLOCKS:
+            self.flush()
+        if tag in _HTML_VOID:
+            return
+        skips = tag in _HTML_SKIP or hidden
+        is_heading = tag in _HTML_HEADINGS or "msotitle" in classes or "msosubtitle" in classes
+        is_big = _is_big_font(tag, attrs, style)
+        self.stack.append((tag, skips, is_heading, is_big))
+        self.skip += skips
+        self.heading += is_heading
+        self.big += is_big
+        if tag in _HTML_BLOCKS or is_heading:
+            self.para_heading = self.heading > 0
+
+    def handle_startendtag(self, tag, attrs):
+        self.handle_starttag(tag, attrs)
+        if tag not in _HTML_VOID:
+            self.handle_endtag(tag)
+
+    def handle_endtag(self, tag):
+        if not any(entry[0] == tag for entry in self.stack):
+            return  # stray end tag
+        while self.stack:
+            open_tag, skips, is_heading, is_big = self.stack.pop()
+            self.skip -= skips
+            self.heading -= is_heading
+            self.big -= is_big
+            if open_tag == tag:
+                break
+        if tag in _HTML_BLOCKS or tag in _HTML_HEADINGS:
+            self.flush()
+            self.para_heading = self.heading > 0
+
+    def handle_data(self, data):
+        if not self.skip:
+            self.text.append(data)
+            n = len(data.strip())
+            self.chars += n
+            if self.big:
+                self.big_chars += n
+
+    def close(self):
+        super().close()
+        self.flush()
+
+
+def extract_items_html(path, warnings=None):
+    """
+    Read an HTML (or .mht) file into paragraph items like extract_items().
+    Pictures are loaded from the files next to the page (e.g. Word's
+    "<name>_files" folder), from inside an .mht file, or from data: URIs.
+    Pictures on the web are not downloaded.
+    """
+    warnings = warnings if warnings is not None else []
+    name = os.path.basename(path)
+    with open(path, "rb") as f:
+        raw = f.read()
+    folder = os.path.dirname(os.path.abspath(path))
+
+    head = raw[:2048].lstrip().lower()
+    if head.startswith(b"mime-version") or path.lower().endswith((".mht", ".mhtml")):
+        page, base, parts = _read_mht(raw)
+    else:
+        page, base, parts = _decode_html(raw), "", {}
+
+    missing, remote = [], 0
+    cache = {}
+
+    def load_image(src):
+        nonlocal remote
+        src = src.strip()
+        if not src:
+            return None
+        if src in cache:
+            return cache[src]
+        data, filename = None, None
+        if src.lower().startswith("data:"):
+            header, _, payload = src.partition(",")
+            try:
+                data = base64.b64decode(payload) if ";base64" in header.lower() else unquote(payload).encode("latin-1")
+            except Exception:
+                data = None
+            ext = {"image/jpeg": "jpg", "image/gif": "gif", "image/bmp": "bmp",
+                   "image/svg+xml": "svg"}.get(header[5:].split(";")[0].lower(), "png")
+            filename = f"embedded-image-{len(cache) + 1}.{ext}"
+        elif parts:
+            for key in (src, urljoin(base, src) if base else src):
+                if key in parts:
+                    data = parts[key]
+                    break
+            else:  # last resort: match by file name only
+                wanted = unquote(src.split("?")[0]).replace("\\", "/").rsplit("/", 1)[-1]
+                for location, blob in parts.items():
+                    if location.replace("\\", "/").rsplit("/", 1)[-1] == wanted:
+                        data = blob
+                        break
+            filename = unquote(src.split("?")[0]).replace("\\", "/").rsplit("/", 1)[-1]
+            if data is None:
+                missing.append(src)
+        elif re.match(r"^[a-z][a-z0-9+.-]*://", src, re.I) and not src.lower().startswith("file:"):
+            remote += 1
+        else:
+            local = unquote(src.split("#")[0].split("?")[0])
+            if local.lower().startswith("file:"):
+                local = url2pathname(local[5:].lstrip("/") if os.name == "nt" else local[5:])
+            full = os.path.normpath(os.path.join(folder, local.replace("/", os.sep)))
+            filename = os.path.basename(full)
+            if (full.lower().endswith(_IMAGE_EXTENSIONS) and os.path.isfile(full)
+                    and os.path.getsize(full) <= _MAX_IMAGE_BYTES):
+                with open(full, "rb") as f:
+                    data = f.read()
+            else:
+                missing.append(src)
+        img = None
+        if data:
+            img = {"filename": filename, "partname": filename, "bytes": data,
+                   "hash": image_fingerprint(data)}
+        cache[src] = img
+        return img
+
+    reader = _HtmlReader(load_image)
+    reader.feed(page)
+    reader.close()
+
+    if missing:
+        warnings.append(
+            f"{len(missing)} picture(s) used by {name} could not be found (for example "
+            f"{missing[0]}). Keep the folder with the page's pictures next to the HTML file."
+        )
+    if remote:
+        warnings.append(f"{remote} picture(s) in {name} are on the web and were not downloaded or compared.")
+    return reader.items
+
+
+def file_kind(path):
+    """'pdf', 'html' or 'word' (a .docx; old .doc files are converted before this)."""
+    if is_pdf(path):
+        return "pdf"
+    if is_html(path):
+        return "html"
+    return "word"
+
+
+def load_document(path, split_before="", warnings=None):
+    """Read a .docx, .pdf or .html file into paragraph items."""
     if is_pdf(path):
         return extract_items_pdf(path, split_before)
+    if is_html(path):
+        return extract_items_html(path, warnings)
     return extract_items(path)
 
 
@@ -1544,14 +1847,14 @@ def run_comparison(file1, file2, output_path, requirement_prefix=DEFAULT_REQUIRE
     """
     Do the full comparison and write the HTML report to output_path.
     Each file may be a Word file (.docx, or old .doc which is converted
-    first) or a PDF.
+    first), a PDF or an HTML page.
     Returns (summary_dict, diagnostic_message_or_None).
     """
     with tempfile.TemporaryDirectory(prefix="compare_docx_") as tmp:
         notes = []
         readable = []
         for tag, path in (("old", file1), ("new", file2)):
-            if is_legacy_word(path):
+            if not is_html(path) and is_legacy_word(path):
                 converted, program = convert_to_docx(path, os.path.join(tmp, tag))
                 notes.append(f"{os.path.basename(path)} is an old-format Word file (.doc); "
                              f"it was converted to .docx with {program} before comparing.")
@@ -1563,12 +1866,16 @@ def run_comparison(file1, file2, output_path, requirement_prefix=DEFAULT_REQUIRE
 
 
 def _compare_files(file1, file2, output_path, requirement_prefix, name1, name2, notes):
-    """run_comparison() for files that are .docx or PDF."""
-    pdf1, pdf2 = is_pdf(file1), is_pdf(file2)
-    items1 = load_document(file1, requirement_prefix)
-    items2 = load_document(file2, requirement_prefix)
-
+    """run_comparison() for files that are .docx, PDF or HTML."""
     notes = list(notes)
+    kind1, kind2 = file_kind(file1), file_kind(file2)
+    pdf1, pdf2 = kind1 == "pdf", kind2 == "pdf"
+    items1 = load_document(file1, requirement_prefix, notes)
+    items2 = load_document(file2, requirement_prefix, notes)
+    # Different formats lay paragraphs out differently: compare the words
+    # and figures in order, not paragraph by paragraph.
+    mixed = pdf1 or pdf2 or kind1 != kind2
+
     if pdf1 or pdf2:
         notes.append(
             "A PDF is involved, so where paragraphs and lines break is ignored: only the "
@@ -1577,27 +1884,35 @@ def _compare_files(file1, file2, output_path, requirement_prefix, name1, name2, 
             "store automatic numbers as text either). A figure that was re-saved when the PDF "
             "was made counts as unchanged if it shows the same picture; such figures are marked."
         )
-    if pdf1 != pdf2:
-        # Vector drawings (EMF/WMF) in Word become lines in a PDF, not pictures,
-        # so they can't be compared; leave them out instead of calling them removed.
-        word_items = items2 if pdf1 else items1
+    elif mixed:
+        notes.append(
+            "The files are in different formats, so where paragraphs and lines break is "
+            "ignored: only the wording, its order and the figures are compared. A figure "
+            "that was re-saved in the other format counts as unchanged if it shows the same "
+            "picture; such figures are marked."
+        )
+    if kind1 != kind2:
+        # Vector drawings (EMF/WMF) can't be compared across formats (a PDF
+        # draws them as lines, a web page uses a picture copy instead);
+        # leave them out instead of calling them removed.
         skipped = 0
-        for it in word_items:
-            keep = [img for img in it["images"] if image_thumbnail(img["bytes"]) is not None]
-            skipped += len(it["images"]) - len(keep)
-            it["images"] = keep
-        word_items[:] = [it for it in word_items if it["text"] or it["images"]]
+        for items in (items1, items2):
+            for it in items:
+                keep = [img for img in it["images"] if image_thumbnail(img["bytes"]) is not None]
+                skipped += len(it["images"]) - len(keep)
+                it["images"] = keep
+            items[:] = [it for it in items if it["text"] or it["images"]]
         if skipped:
             notes.append(
-                f"{skipped} figure(s) in the Word file are vector drawings (EMF/WMF) that "
-                f"can't be compared with a PDF; they were left out."
+                f"{skipped} figure(s) are vector drawings (EMF/WMF) that can't be compared "
+                f"across file formats; they were left out."
             )
-    if pdf1 or pdf2:
+    if mixed:
         match_similar_images(items1, items2)
 
     page, summary = build_report(
         items1, items2, name1, name2,
-        requirement_prefix, flow=pdf1 or pdf2, notes=notes,
+        requirement_prefix, flow=mixed, notes=notes,
     )
 
     with open(output_path, "w", encoding="utf-8") as f:
@@ -1606,18 +1921,18 @@ def _compare_files(file1, file2, output_path, requirement_prefix, name1, name2, 
     # Diagnostic: warn if some image files inside a .docx never showed up
     # in the report. (A picture used several times is stored only once, so
     # we compare which files were used, not how many times.)
-    def coverage(path, items, pdf):
-        if pdf:
+    def coverage(path, items, kind):
+        if kind != "word":
             return 0, 0
         on_disk = list_media_files(path)
         used = {img["partname"].lstrip("/") for it in items for img in it["images"]}
         return len(on_disk), len(on_disk & used)
 
-    on_disk1, placed1 = coverage(file1, items1, pdf1)
-    on_disk2, placed2 = coverage(file2, items2, pdf2)
+    on_disk1, placed1 = coverage(file1, items1, kind1)
+    on_disk2, placed2 = coverage(file2, items2, kind2)
 
     diagnostic = None
-    if (placed1 < on_disk1 or placed2 < on_disk2) and not (pdf1 or pdf2):
+    if (placed1 < on_disk1 or placed2 < on_disk2) and kind1 == kind2 == "word":
         diagnostic = (
             f"Note: some images inside the files were not matched to any text.\n"
             f"  {name1}: {on_disk1} image file(s) found, {placed1} matched\n"
@@ -1626,7 +1941,7 @@ def _compare_files(file1, file2, output_path, requirement_prefix, name1, name2, 
             f"or a format this tool doesn't recognize yet."
         )
     elif placed1 < on_disk1 or placed2 < on_disk2:
-        word_name, on_disk, placed = (name1, on_disk1, placed1) if not pdf1 else (name2, on_disk2, placed2)
+        word_name, on_disk, placed = (name1, on_disk1, placed1) if kind1 == "word" else (name2, on_disk2, placed2)
         diagnostic = (
             f"Note: {on_disk - placed} image file(s) in {word_name} were not compared\n"
             f"(header/footer pictures, vector drawings, or a format this tool doesn't recognize)."
@@ -1639,7 +1954,8 @@ def _compare_files(file1, file2, output_path, requirement_prefix, name1, name2, 
 # GUI
 # ===========================================================================
 
-DOCUMENT_TYPES = [("Word or PDF", "*.docx *.doc *.pdf"), ("Word documents", "*.docx *.doc"),
+DOCUMENT_TYPES = [("Word, PDF or HTML", "*.docx *.doc *.pdf *.html *.htm *.mht *.mhtml"),
+                  ("Word documents", "*.docx *.doc"), ("Web pages", "*.html *.htm *.mht *.mhtml"),
                   ("PDF files", "*.pdf")]
 
 
@@ -1655,13 +1971,13 @@ class CompareApp:
         frame.grid(row=0, column=0, sticky="nsew")
 
         # --- Old file ---
-        ttk.Label(frame, text="Old / original file (.docx, .doc or .pdf):").grid(row=0, column=0, sticky="w", **padding)
+        ttk.Label(frame, text="Old / original file (.docx, .doc, .pdf or .html):").grid(row=0, column=0, sticky="w", **padding)
         self.file1_var = tk.StringVar()
         ttk.Entry(frame, textvariable=self.file1_var, width=55).grid(row=1, column=0, columnspan=2, sticky="we", padx=10)
         ttk.Button(frame, text="Browse...", command=self.pick_file1).grid(row=1, column=2, padx=10)
 
         # --- New file ---
-        ttk.Label(frame, text="New / updated file (.docx, .doc or .pdf):").grid(row=2, column=0, sticky="w", **padding)
+        ttk.Label(frame, text="New / updated file (.docx, .doc, .pdf or .html):").grid(row=2, column=0, sticky="w", **padding)
         self.file2_var = tk.StringVar()
         ttk.Entry(frame, textvariable=self.file2_var, width=55).grid(row=3, column=0, columnspan=2, sticky="we", padx=10)
         ttk.Button(frame, text="Browse...", command=self.pick_file2).grid(row=3, column=2, padx=10)
@@ -1720,7 +2036,7 @@ class CompareApp:
         output = self.output_var.get().strip()
 
         if not file1 or not file2:
-            messagebox.showerror("Missing file", "Please choose both the old and the new file (.docx, .doc or .pdf).")
+            messagebox.showerror("Missing file", "Please choose both the old and the new file (.docx, .doc, .pdf or .html).")
             return
         if not os.path.isfile(file1):
             messagebox.showerror("File not found", f"Can't find this file:\n{file1}")
@@ -1743,7 +2059,7 @@ class CompareApp:
 
         self.open_btn.grid_remove()
         self.compare_btn.config(state="disabled")
-        if is_legacy_word(file1) or is_legacy_word(file2):
+        if any(not is_html(f) and is_legacy_word(f) for f in (file1, file2)):
             self.status_var.set("Converting the .doc file(s) and comparing... this can take up to a minute.")
         else:
             self.status_var.set("Comparing... this may take a few seconds for large files.")

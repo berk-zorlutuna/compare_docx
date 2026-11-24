@@ -1,3 +1,4 @@
+import base64
 import io
 import os
 import re
@@ -1055,6 +1056,193 @@ def test_doc_vs_its_own_docx_has_no_changes(doc_files, tmp_path):
 def test_doc_combinations_find_the_same_changes(doc_files, tmp_path, a, b):
     out = str(tmp_path / "r.html")
     s, _ = cd.run_comparison(doc_files[a], doc_files[b], out)
+    assert change_list(out) == [
+        ("Changed", "Requirement Number 3"),
+        ("Changed", "Diagnostics and logging"),
+        ("Changed", "Requirement Number 5"),
+        ("Removed", "Requirement Number 6"),
+        ("Changed", "Requirement Number 7"),
+        ("Changed", "Requirement Number 8"),
+        ("New", "Requirement Number 13"),
+    ]
+
+
+# ---------- HTML ----------
+
+def write(tmp_path, name, content, encoding="utf-8"):
+    p = tmp_path / name
+    p.write_bytes(content.encode(encoding) if isinstance(content, str) else content)
+    return str(p)
+
+
+def html_texts(path, warnings=None):
+    return [("#" if i["heading"] else "") + (i["text"] or "[img]") + ("+img" * bool(i["text"] and i["images"]))
+            for i in cd.extract_items_html(path, warnings)]
+
+
+def test_is_html(tmp_path):
+    a = write(tmp_path, "a.html", "<p>x</p>")
+    b = write(tmp_path, "noext", "\ufeff  <!DOCTYPE html><html><body>x</body></html>")
+    c = write(tmp_path, "word.doc", "<html xmlns:o='urn:schemas-microsoft-com:office:office'><body>x</body></html>")
+    d = make(tmp_path, "d.docx", paras("x"))
+    assert cd.is_html(a) and cd.is_html(b) and cd.is_html(c) and not cd.is_html(d)
+    assert not cd.is_legacy_word(c)   # a web page saved as ".doc" is read as HTML, not converted
+
+
+def test_generic_html_structure(tmp_path):
+    p = write(tmp_path, "a.html", """<!DOCTYPE html><html><head><title>Ignored title</title>
+      <style>p { color: red }</style><script>var x = "<p>not text</p>";</script></head>
+      <body>
+        <h1>System &amp; Requirements</h1>
+        <div><div>Nested <b>bold</b> text,
+           spread over lines.</div></div>
+        <p>Line one<br>line two<br/>line&nbsp;three</p>
+        <ol><li>First item</li><li>Second <i>item</i></li></ol>
+        <table><tr><th>Parameter</th><th>Value</th></tr><tr><td>Timeout</td><td>30 s</td></tr></table>
+        <p style="display: none">Hidden text</p>
+        <p hidden>Also hidden</p>
+        </span></div><p>After stray end tags</p>
+        <p class="note">Unclosed paragraph
+        <p>Next paragraph</p>
+      </body></html>""")
+    assert html_texts(p) == [
+        "#System & Requirements", "Nested bold text, spread over lines.",
+        "Line one line two line three", "First item", "Second item",
+        "Parameter", "Value", "Timeout", "30 s", "After stray end tags",
+        "Unclosed paragraph", "Next paragraph"]
+
+
+def test_html_big_font_paragraph_is_a_title(tmp_path):
+    p = write(tmp_path, "a.html", """<html><body>
+      <p><font size="6" style="font-size: 26pt">Software Requirements</font></p>
+      <p style="font-size: 11pt">Body text <span style="font-size:16pt">big word</span> in a sentence.</p>
+      <p><span style="font-size: 24px">Big pixel title</span></p></body></html>""")
+    assert html_texts(p) == ["#Software Requirements", "Body text big word in a sentence.", "#Big pixel title"]
+
+
+WORD_HTML = """<html xmlns:v="urn:schemas-microsoft-com:vml" xmlns:o="urn:schemas-microsoft-com:office:office">
+<head><meta http-equiv=Content-Type content="text/html; charset=windows-1252">
+<style><!-- p.MsoNormal {margin:0cm;} --></style></head>
+<body lang=EN-US>
+<div class=WordSection1>
+<p class=MsoTitle>Software Requirements Specification</p>
+<h1 style='mso-list:l0 level1 lfo1'><![if !supportLists]><span style='mso-list:Ignore'>1<span
+style='font:7.0pt "Times New Roman"'>&nbsp;&nbsp;&nbsp; </span></span><![endif]>Power supervision</h1>
+<p class=MsoNormal>Requirement Number 1</p>
+<p class=MsoNormal>The unit shall report the caf\xe9 temperature<a style='mso-footnote-id:ftn1'
+href="#_ftn1" name="_ftnref1"><span class=MsoFootnoteReference>[1]</span></a>.</p>
+<p class=MsoListParagraph style='mso-list:l1 level1 lfo2'><![if !supportLists]><span
+style='mso-list:Ignore'>1.<span style='font:7.0pt "Times New Roman"'>&nbsp;&nbsp; </span></span><![endif]>Over-voltage</p>
+<p class=MsoListParagraph style='mso-list:l1 level1 lfo2'><![if !supportLists]><span
+style='mso-list:Ignore'>2.<span style='font:7.0pt "Times New Roman"'>&nbsp;&nbsp; </span></span><![endif]>Under-voltage</p>
+<p class=MsoNormal><!--[if gte vml 1]><v:shape id="Picture_1" style='width:200pt;height:100pt'>
+ <v:imagedata src="spec_files/image001.png" o:title=""/></v:shape><![endif]--><![if !vml]><img
+width=267 height=133 src="spec_files/image002.png" v:shapes="Picture_1"><![endif]></p>
+</div>
+<div style='mso-element:footnote-list'><div style='mso-element:footnote' id=ftn1>
+<p class=MsoFootnoteText>[1] A footnote that the .docx comparison doesn't include.</p></div></div>
+</body></html>"""
+
+
+def word_html(tmp_path, picture_color="red"):
+    (tmp_path / "spec_files").mkdir(exist_ok=True)
+    (tmp_path / "spec_files" / "image002.png").write_bytes(png(picture_color).getvalue())
+    return write(tmp_path, "spec.htm", WORD_HTML, "cp1252")
+
+
+def test_word_html_conventions(tmp_path):
+    p = word_html(tmp_path)
+    assert html_texts(p) == [
+        "#Software Requirements Specification",
+        "#Power supervision",                      # automatic heading number left out
+        "Requirement Number 1",
+        "The unit shall report the café temperature.",   # windows-1252; footnote mark left out
+        "Over-voltage", "Under-voltage",           # automatic list numbers left out
+        "[img]",                                   # the picture, once (VML copy ignored)
+    ]                                              # footnote text left out
+
+
+def test_word_html_vs_equivalent_docx_has_no_changes(tmp_path):
+    p = word_html(tmp_path)
+    def build(doc):
+        doc.add_heading("Software Requirements Specification", 0)
+        doc.add_heading("Power supervision", 1)
+        doc.add_paragraph("Requirement Number 1")
+        doc.add_paragraph("The unit shall report the café temperature.")
+        doc.add_paragraph("Over-voltage", style="List Number")
+        doc.add_paragraph("Under-voltage", style="List Number")
+        doc.add_paragraph().add_run().add_picture(png("red"), width=Inches(1))
+    d = make(tmp_path, "spec.docx", build)
+    out = str(tmp_path / "r.html")
+    s, _ = cd.run_comparison(d, p, out)
+    assert change_list(out) == []
+    assert (s["img_same"], s["img_added"], s["img_removed"]) == (1, 0, 0)
+    assert s["title_same"] == 2
+
+
+def test_html_image_change_detected(tmp_path):
+    old_dir, new_dir = tmp_path / "old", tmp_path / "new"
+    old_dir.mkdir(); new_dir.mkdir()
+    s, _ = cd.run_comparison(word_html(old_dir, "red"), word_html(new_dir, "blue"), str(tmp_path / "r.html"))
+    assert (s["img_same"], s["img_added"], s["img_removed"]) == (0, 1, 1)
+
+
+def test_html_image_sources(tmp_path):
+    (tmp_path / "pics").mkdir()
+    (tmp_path / "pics" / "my figure.png").write_bytes(png("red").getvalue())
+    data_uri = "data:image/png;base64," + base64.b64encode(png("blue").getvalue()).decode()
+    p = write(tmp_path, "a.html", f"""<html><body>
+      <p>Relative <img src="pics/my%20figure.png"></p>
+      <p>Embedded <img src="{data_uri}"></p>
+      <p>Web <img src="https://example.com/x.png"></p>
+      <p>Missing <img src="pics/gone.png"></p>
+      <p>Not a picture <img src="../secret.txt"></p></body></html>""")
+    warnings = []
+    items = cd.extract_items_html(p, warnings)
+    assert [len(i["images"]) for i in items] == [1, 1, 0, 0, 0]
+    assert any("2 picture(s) used by a.html could not be found" in w for w in warnings), warnings
+    assert any("1 picture(s) in a.html are on the web" in w for w in warnings), warnings
+
+
+def test_mht_single_file_web_page(tmp_path):
+    from email.mime.multipart import MIMEMultipart
+    from email.mime.text import MIMEText
+    from email.mime.image import MIMEImage
+    msg = MIMEMultipart("related", type="text/html")
+    page = MIMEText(WORD_HTML, "html", "windows-1252")
+    page["Content-Location"] = "file:///C:/Docs/spec.htm"
+    msg.attach(page)
+    pic = MIMEImage(png("red").getvalue(), "png")
+    pic["Content-Location"] = "file:///C:/Docs/spec_files/image002.png"
+    msg.attach(pic)
+    p = write(tmp_path, "spec.mht", msg.as_bytes())
+    assert cd.is_html(p)
+    assert html_texts(p)[-1] == "[img]" and html_texts(p)[3] == "The unit shall report the café temperature."
+
+
+@pytest.fixture(scope="module")
+def html_files(spec_files, tmp_path_factory):
+    """The same two specs, saved as web pages by LibreOffice."""
+    d = tmp_path_factory.mktemp("html")
+    subprocess.run([SOFFICE, "--headless", "--convert-to", "html", "--outdir", str(d),
+                    spec_files["v1.docx"], spec_files["v2.docx"]],
+                   check=True, capture_output=True, timeout=300)
+    return dict(spec_files, **{"v1.html": str(d / "v1.html"), "v2.html": str(d / "v2.html")})
+
+
+@pytest.mark.parametrize("a, b", [("v1.docx", "v1.html"), ("v1.html", "v1.pdf")])
+def test_html_vs_same_document_has_no_changes(html_files, tmp_path, a, b):
+    out = str(tmp_path / "r.html")
+    s, _ = cd.run_comparison(html_files[a], html_files[b], out)
+    assert change_list(out) == []
+    assert s["img_added"] == s["img_removed"] == 0
+
+
+@pytest.mark.parametrize("a, b", [("v1.html", "v2.html"), ("v1.docx", "v2.html"),
+                                  ("v1.html", "v2.docx"), ("v1.pdf", "v2.html"), ("v1.html", "v2.pdf")])
+def test_html_combinations_find_the_same_changes(html_files, tmp_path, a, b):
+    out = str(tmp_path / "r.html")
+    cd.run_comparison(html_files[a], html_files[b], out)
     assert change_list(out) == [
         ("Changed", "Requirement Number 3"),
         ("Changed", "Diagnostics and logging"),

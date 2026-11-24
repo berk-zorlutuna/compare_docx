@@ -35,6 +35,24 @@ If neither is available, open the file in Word, choose File > Save As >
 Word Document (.docx), and compare the `.docx`. The report notes which files
 were converted and with which program.
 
+## HTML files
+
+Web pages (`.html`, `.htm`) and Word's single-file web pages (`.mht`,
+`.mhtml`) can be compared too, with each other or with Word and PDF files.
+No extra package is needed.
+
+- Headings (`<h1>`…`<h6>`, Word's Title style, or short paragraphs in a large
+  font) are titles; paragraphs, list items and table cells are separate items.
+- Scripts, styles and hidden text are ignored, and so are the parts Word files
+  don't contribute to the comparison either: page headers/footers, footnotes,
+  and automatic list or heading numbers as Word and LibreOffice write them.
+- Pictures are read from the files next to the page (keep Word's
+  `<name>_files` folder next to the `.htm` file), from inside an `.mht` file,
+  or from embedded `data:` pictures. Pictures on the web are not downloaded;
+  the report says how many were skipped or missing.
+- When the two files are in different formats (for example HTML vs Word),
+  where paragraphs break is ignored, as with PDFs.
+
 ## PDF files
 
 Either file can be a Word file or a PDF, so Word vs Word, PDF vs PDF and
