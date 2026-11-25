@@ -70,6 +70,9 @@ W_R = qn("w:r")
 W_T = qn("w:t")
 W_TAB = qn("w:tab")
 W_BREAKS = (qn("w:br"), qn("w:cr"))
+W_TBL = qn("w:tbl")
+W_TR = qn("w:tr")
+W_TC = qn("w:tc")
 # Word stores some content (e.g. text boxes) twice: a modern version and a
 # legacy "fallback" copy for old versions of Word. We skip the fallback copy
 # so that content isn't reported twice.
@@ -182,19 +185,67 @@ def is_heading(p_elm, heading_style_ids):
     return style is not None and style.get(qn("w:val")) in heading_style_ids
 
 
+# ===========================================================================
+# Tables (shared by the Word, HTML and PDF readers)
+# ===========================================================================
+#
+# A table row is one item: its "text" is all cell texts joined (so
+# requirements, matching and diffs work as for paragraphs), and "cells"
+# keeps the cells so the report can draw a real table.
+
+# A table cell with more paragraphs than this is page layout, not data.
+TABLE_LAYOUT_MAX_PARAGRAPHS = 30
+
+
+def make_row_item(cells, table_id, header=False):
+    """cells: [{"text": str, "images": [...], "span": int}, ...]"""
+    text = " ".join(" ".join(c["text"].split()) for c in cells if c["text"].strip())
+    images = [img for c in cells for img in c["images"]]
+    return {"text": text, "images": images, "heading": False,
+            "table": table_id, "cells": cells, "header": header}
+
+
+def table_to_items(rows, table_id, out):
+    """
+    rows: [(cells, is_header_row), ...] where each cell is
+    {"paras": [paragraph items], "span": int}. Appends row items to `out`.
+
+    Tables used only for page layout -- a single framing cell, or cells
+    holding titles or many paragraphs -- are read as ordinary paragraphs
+    instead, the same way in every file format.
+    """
+    all_cells = [c for cells, _ in rows for c in cells]
+    layout = (len(all_cells) <= 1
+              or any(p.get("heading") for c in all_cells for p in c["paras"])
+              or any(len(c["paras"]) > TABLE_LAYOUT_MAX_PARAGRAPHS for c in all_cells))
+    if layout:
+        for c in all_cells:
+            out.extend(c["paras"])
+        return
+    for cells, header in rows:
+        row = [{"text": "\n".join(p["text"] for p in c["paras"] if p["text"]),
+                "images": [img for p in c["paras"] for img in p["images"]],
+                "span": c.get("span", 1)} for c in cells]
+        if any(c["text"].strip() or c["images"] for c in row):
+            out.append(make_row_item(row, table_id, header))
+
+
 def extract_items(path):
     """
     Walk through a .docx file's raw XML in document order and return a list
-    of paragraph items, one per non-empty paragraph:
+    of items, one per non-empty paragraph or table row:
 
         {"text": "...", "heading": True/False,
          "images": [{"filename": ..., "partname": ..., "bytes": ..., "hash": ...}, ...]}
 
-    "heading" is True for titles (paragraphs using a Word heading/title style).
+    Table rows additionally have "table" (a number per table), "cells" and
+    "header". "heading" is True for titles (paragraphs using a Word
+    heading/title style).
 
     Scanning the raw XML (rather than only python-docx's top-level paragraph
     list) means content is found no matter how it's nested — inside tables,
-    nested tables, text boxes, or content controls (structured document tags).
+    nested tables (flattened into their cell), text boxes, or content
+    controls (structured document tags).
 
     Two kinds of image references are recognized:
       - Modern images:  <a:blip r:embed="..."/>
@@ -211,11 +262,9 @@ def extract_items(path):
     items = []
     fingerprints = {}
     heading_ids = heading_styles(doc)
+    table_count = [0]
 
-    for p_elm in _walk(body):
-        if p_elm.tag != W_P:
-            continue
-
+    def paragraph_item(p_elm):
         text_parts = []
         images = []
         for el in _walk(p_elm, stay_in_paragraph=True):
@@ -260,11 +309,73 @@ def extract_items(path):
 
         text = "".join(text_parts).strip()
         if not text and not images:
-            continue  # skip fully empty paragraphs
+            return None  # skip fully empty paragraphs
+        return {"text": text, "images": images,
+                "heading": bool(text) and is_heading(p_elm, heading_ids)}
 
-        items.append({"text": text, "images": images,
-                      "heading": bool(text) and is_heading(p_elm, heading_ids)})
+    def text_boxes(element):
+        """Text box contents inside a paragraph (not Word's legacy duplicate copies)."""
+        for child in element:
+            if not isinstance(child.tag, str) or child.tag == MC_FALLBACK:
+                continue
+            if child.tag.endswith("}txbxContent"):
+                yield child
+            else:
+                yield from text_boxes(child)
 
+    def find(element, tag):
+        """Rows of a table / cells of a row, also when wrapped in content controls."""
+        for child in element:
+            if not isinstance(child.tag, str) or child.tag in (W_TBL, W_P):
+                continue
+            if child.tag == tag:
+                yield child
+            else:
+                yield from find(child, tag)
+
+    def emit_table(tbl, out):
+        table_count[0] += 1
+        table_id = table_count[0]
+        rows = []
+        for tr in find(tbl, W_TR):
+            tr_pr = tr.find(qn("w:trPr"))
+            header = tr_pr is not None and tr_pr.find(qn("w:tblHeader")) is not None
+            cells = []
+            for tc in find(tr, W_TC):
+                tc_pr = tc.find(qn("w:tcPr"))
+                span, merged_below = 1, False
+                if tc_pr is not None:
+                    grid_span = tc_pr.find(qn("w:gridSpan"))
+                    if grid_span is not None:
+                        try:
+                            span = max(1, int(grid_span.get(qn("w:val"))))
+                        except (TypeError, ValueError):
+                            pass
+                    v_merge = tc_pr.find(qn("w:vMerge"))
+                    merged_below = v_merge is not None and v_merge.get(qn("w:val")) != "restart"
+                paras = []
+                if not merged_below:  # a merged cell's text belongs to the cell above
+                    emit(tc, paras)
+                cells.append({"paras": paras, "span": span})
+            rows.append((cells, header))
+        table_to_items(rows, table_id, out)
+
+    def emit(container, out):
+        for child in container:
+            if not isinstance(child.tag, str) or child.tag == MC_FALLBACK:
+                continue
+            if child.tag == W_P:
+                item = paragraph_item(child)
+                if item:
+                    out.append(item)
+                for box in text_boxes(child):
+                    emit(box, out)
+            elif child.tag == W_TBL:
+                emit_table(child, out)
+            else:
+                emit(child, out)
+
+    emit(body, items)
     return items
 
 
@@ -334,6 +445,135 @@ def _pdf_image(block, page_number, index):
             "hash": image_fingerprint(data)}
 
 
+def _centre_in(bbox, area):
+    x = (bbox[0] + bbox[2]) / 2
+    y = (bbox[1] + bbox[3]) / 2
+    return area[0] <= x <= area[2] and area[1] <= y <= area[3]
+
+
+def _merge_segments(segments):
+    """Join border pieces that lie on the same line and touch: [(pos, start, end), ...]."""
+    merged = []
+    for pos, a, b in sorted(segments):
+        last = merged[-1] if merged else None
+        if last and abs(last[0] - pos) <= 1.0 and a <= last[2] + 2.0:
+            merged[-1] = (last[0], last[1], max(last[2], b))
+        else:
+            merged.append((pos, a, b))
+    return merged
+
+
+def _cluster(values, tolerance=1.5):
+    """Sorted positions with near-duplicates removed."""
+    out = []
+    for v in sorted(values):
+        if not out or v - out[-1] > tolerance:
+            out.append(v)
+    return out
+
+
+def _find_pdf_tables(page):
+    """
+    Ruled tables on a PDF page, rebuilt from the border lines Word and
+    LibreOffice draw: [(bbox, rows)] where rows holds, per row, one entry per
+    grid column -- the cell's box, or None where a merged cell to its left
+    covers that column. Tables without drawn borders are not found (their
+    text is then compared as ordinary paragraphs).
+    """
+    try:
+        drawings = page.get_drawings()
+    except Exception:
+        return []
+    horizontal, vertical = [], []   # (y, x0, x1), (x, y0, y1)
+    for d in drawings:
+        stroked = d.get("color") is not None
+        for item in d["items"]:
+            kind = item[0]
+            if kind == "l":
+                p, q = item[1], item[2]
+                if abs(p.y - q.y) < 1 and abs(p.x - q.x) >= 2:
+                    horizontal.append(((p.y + q.y) / 2, min(p.x, q.x), max(p.x, q.x)))
+                elif abs(p.x - q.x) < 1 and abs(p.y - q.y) >= 2:
+                    vertical.append(((p.x + q.x) / 2, min(p.y, q.y), max(p.y, q.y)))
+            elif kind in ("re", "qu"):
+                r = item[1] if kind == "re" else item[1].rect
+                if r.height <= 2.5 < r.width:          # a border drawn as a thin bar
+                    horizontal.append(((r.y0 + r.y1) / 2, r.x0, r.x1))
+                elif r.width <= 2.5 < r.height:
+                    vertical.append(((r.x0 + r.x1) / 2, r.y0, r.y1))
+                elif stroked and r.width > 2.5 and r.height > 2.5:   # an outlined box
+                    horizontal += [(r.y0, r.x0, r.x1), (r.y1, r.x0, r.x1)]
+                    vertical += [(r.x0, r.y0, r.y1), (r.x1, r.y0, r.y1)]
+    if len(horizontal) < 2 or len(vertical) < 2:
+        return []
+    horizontal, vertical = _merge_segments(horizontal), _merge_segments(vertical)
+
+    # Border lines that touch each other belong to the same table.
+    tol = 2.0
+    parent = list(range(len(horizontal) + len(vertical)))
+
+    def root(i):
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    for i, (y, x0, x1) in enumerate(horizontal):
+        for j, (x, y0, y1) in enumerate(vertical):
+            if x0 - tol <= x <= x1 + tol and y0 - tol <= y <= y1 + tol:
+                parent[root(i)] = root(len(horizontal) + j)
+    groups = {}
+    for i in range(len(parent)):
+        groups.setdefault(root(i), []).append(i)
+
+    tables = []
+    for members in groups.values():
+        hs = [horizontal[i] for i in members if i < len(horizontal)]
+        vs = [vertical[i - len(horizontal)] for i in members if i >= len(horizontal)]
+        if len(hs) < 2 or len(vs) < 2:
+            continue
+        ys = _cluster(h[0] for h in hs)
+        xs = _cluster(v[0] for v in vs)
+        if len(ys) < 2 or len(xs) < 2:
+            continue
+        rows = []
+        for y0, y1 in zip(ys, ys[1:]):
+            middle = (y0 + y1) / 2
+            # Column borders that actually run through this row (a merged
+            # cell has none inside it).
+            present = [k for k, x in enumerate(xs)
+                       if any(abs(v[0] - x) <= 1.5 and v[1] - tol <= middle <= v[2] + tol for v in vs)]
+            cells = [None] * (len(xs) - 1)
+            for a, b in zip(present, present[1:]):
+                cells[a] = (xs[a], y0, xs[b], y1)
+            if any(cells):
+                rows.append(cells)
+        if rows:
+            tables.append(((xs[0], ys[0], xs[-1], ys[-1]), rows))
+    tables.sort(key=lambda tb: (tb[0][1], tb[0][0]))
+    return tables
+
+
+def _pdf_cell_paras(elements, page_count):
+    """The text lines and pictures of one PDF table cell, as one paragraph."""
+    lines = sorted((e for e in elements if e["type"] == "line"), key=lambda e: (e["bbox"][1], e["bbox"][0]))
+    text = ""
+    for ln in lines:
+        piece = ln["text"]
+        if text.endswith("-") and piece[:1].islower():
+            text += piece
+        elif text:
+            text += " " + piece
+        else:
+            text = piece
+    images = []
+    for n, e in enumerate(e for e in elements if e["type"] == "img"):
+        images.append(_pdf_image(e["block"], page_count, 1000 + n))
+    if not text.strip() and not images:
+        return []
+    return [{"text": text.strip(), "images": images, "heading": False}]
+
+
 def extract_items_pdf(path, split_before=""):
     """
     Read a PDF and return paragraph items in the same shape as extract_items():
@@ -356,7 +596,9 @@ def extract_items_pdf(path, split_before=""):
 
         flags = (pymupdf.TEXTFLAGS_DICT | pymupdf.TEXT_PRESERVE_IMAGES) & ~pymupdf.TEXT_PRESERVE_LIGATURES
         pages = []
+        page_tables = []  # per page: [(table bbox, [[cell bbox or None, ...] per row]), ...]
         for page in doc:
+            page_tables.append(_find_pdf_tables(page))
             height = page.rect.height
             elements = []
             for b in page.get_text("dict", sort=True, flags=flags)["blocks"]:
@@ -424,6 +666,50 @@ def extract_items_pdf(path, split_before=""):
                     sizes[round(e["size"] * 2) / 2] += e["chars"]
         body_size = sizes.most_common(1)[0][0] if sizes else 0
 
+        # --- Tables ------------------------------------------------------
+        # Lines and pictures inside a ruled table are moved into its cells;
+        # the table takes the place of the first of them in reading order.
+        table_count = 0
+        for (_, els), tables in zip(pages, page_tables):
+            for bbox, grid in tables:
+                inside = [e for e in els if e["type"] != "table" and _centre_in(e["bbox"], bbox)]
+                if not inside:
+                    continue
+                table_count += 1
+                rows = []
+                for row_cells in grid:
+                    cells = []
+                    for c, cell_bbox in enumerate(row_cells):
+                        if cell_bbox is None:
+                            continue  # covered by a merged cell
+                        span = 1
+                        while c + span < len(row_cells) and row_cells[c + span] is None:
+                            span += 1
+                        content = [e for e in inside if _centre_in(e["bbox"], cell_bbox)]
+                        cells.append({"paras": _pdf_cell_paras(content, len(pages)), "span": span})
+                    rows.append((cells, False))
+                position = els.index(inside[0])
+                taken = {id(e) for e in inside}
+                els[:] = [e for e in els if id(e) not in taken]
+                els.insert(position, {"type": "table", "rows": rows, "id": table_count,
+                                      "columns": len(grid[0])})
+
+        # A table that ends one page and continues at the top of the next is
+        # one table: give both parts the same number, and drop the header
+        # row that Word repeats on every page.
+        def row_texts(row):
+            return [" ".join(p["text"] for p in c["paras"]) for c in row[0]]
+
+        for (_, before), (_, after) in zip(pages, pages[1:]):
+            if not (before and after and before[-1]["type"] == "table" and after[0]["type"] == "table"):
+                continue
+            first, cont = before[-1], after[0]
+            if first["columns"] != cont["columns"]:
+                continue
+            cont["id"] = first["id"]
+            if cont["rows"] and first["rows"] and row_texts(cont["rows"][0]) == row_texts(first["rows"][0]):
+                cont["rows"] = cont["rows"][1:]
+
         # --- Automatic numbering ---------------------------------------
         # Word doesn't store automatic list/heading numbers and bullets as
         # text, but they are printed in the PDF -- as a separate piece
@@ -482,6 +768,10 @@ def extract_items_pdf(path, split_before=""):
         for page_number, (_, els) in enumerate(pages):
             prev = None
             for e in els:
+                if e["type"] == "table":
+                    paragraphs.append({"table": e})
+                    prev = None
+                    continue
                 if e["type"] == "img":
                     image_count += 1
                     paragraphs.append({"image": _pdf_image(e["block"], page_number, image_count)})
@@ -507,6 +797,9 @@ def extract_items_pdf(path, split_before=""):
 
         items = []
         for p in paragraphs:
+            if "table" in p:
+                table_to_items(p["table"]["rows"], p["table"]["id"], items)
+                continue
             if "image" in p:
                 items.append({"text": "", "heading": False, "images": [p["image"]]})
                 continue
@@ -882,15 +1175,45 @@ class _HtmlReader(HTMLParser):
         self.big = 0             # > 0 while inside large-font text
         self.para_heading = False
         self.chars = self.big_chars = 0
+        self.tables = []         # open tables (nested ones go into the outer cell)
+        self.table_count = 0
+
+    def destination(self):
+        """Where finished paragraphs go: the open table cell, or the document."""
+        for table in reversed(self.tables):
+            if table["cell"] is not None:
+                return table["cell"]["paras"]
+        return self.items
 
     def flush(self):
         text = " ".join("".join(self.text).split())
         if text or self.images:
             big = self.chars > 0 and self.big_chars >= 0.8 * self.chars and len(text) <= 200
-            self.items.append({"text": text, "images": self.images,
-                               "heading": bool(text) and (self.para_heading or big)})
+            self.destination().append({"text": text, "images": self.images,
+                                       "heading": bool(text) and (self.para_heading or big)})
         self.text, self.images = [], []
         self.chars = self.big_chars = 0
+
+    def close_cell(self):
+        table = self.tables[-1]
+        if table["cell"] is not None:
+            if table["row"] is None:
+                table["row"] = []
+            table["row"].append(table["cell"])
+            table["cell"] = None
+
+    def close_row(self):
+        self.close_cell()
+        table = self.tables[-1]
+        if table["row"]:
+            header = table["thead"] or all(c["th"] for c in table["row"])
+            table["rows"].append((table["row"], header))
+        table["row"] = None
+
+    def close_table(self):
+        self.close_row()
+        table = self.tables.pop()
+        table_to_items(table["rows"], table["id"], self.destination())
 
     def handle_starttag(self, tag, attrs):
         attrs = dict(attrs)
@@ -914,6 +1237,27 @@ class _HtmlReader(HTMLParser):
             self.flush()
         if tag in _HTML_VOID:
             return
+        if not self.skip and not hidden:
+            if tag == "table":
+                self.table_count += 1
+                self.tables.append({"id": self.table_count, "rows": [], "row": None, "cell": None,
+                                    "thead": False})
+            elif tag == "thead" and self.tables:
+                self.close_row()
+                self.tables[-1]["thead"] = True
+            elif tag in ("tbody", "tfoot") and self.tables:
+                self.close_row()
+                self.tables[-1]["thead"] = False
+            elif tag == "tr" and self.tables:
+                self.close_row()
+                self.tables[-1]["row"] = []
+            elif tag in ("td", "th") and self.tables:
+                self.close_cell()
+                try:
+                    span = max(1, int(attrs.get("colspan") or 1))
+                except ValueError:
+                    span = 1
+                self.tables[-1]["cell"] = {"paras": [], "span": span, "th": tag == "th"}
         skips = tag in _HTML_SKIP or hidden
         is_heading = tag in _HTML_HEADINGS or "msotitle" in classes or "msosubtitle" in classes
         is_big = _is_big_font(tag, attrs, style)
@@ -942,6 +1286,16 @@ class _HtmlReader(HTMLParser):
         if tag in _HTML_BLOCKS or tag in _HTML_HEADINGS:
             self.flush()
             self.para_heading = self.heading > 0
+        if self.tables and not self.skip:
+            if tag in ("td", "th"):
+                self.close_cell()
+            elif tag == "tr":
+                self.close_row()
+            elif tag == "thead":
+                self.close_row()
+                self.tables[-1]["thead"] = False
+            elif tag == "table":
+                self.close_table()
 
     def handle_data(self, data):
         if not self.skip:
@@ -954,6 +1308,8 @@ class _HtmlReader(HTMLParser):
     def close(self):
         super().close()
         self.flush()
+        while self.tables:  # tables left open at the end of the page
+            self.close_table()
 
 
 def extract_items_html(path, warnings=None):
@@ -1246,11 +1602,87 @@ def align_block(old_block, new_block):
     return pairs
 
 
+def _cell_text_html(text):
+    return "<br>".join(html.escape(part) for part in text.split("\n"))
+
+
+def _td(content, status, span):
+    colspan = f' colspan="{span}"' if span > 1 else ""
+    return f'<td class="cell-{status}"{colspan}>{content}</td>'
+
+
+def _single_row_cells(row, kind, img_counts):
+    """All cells of a row that exists on one side only."""
+    parts = []
+    for c in row["cells"]:
+        text = f'<span class="{kind}">{_cell_text_html(c["text"])}</span>' if c["text"].strip() else ""
+        imgs = "".join(image_html(img, kind) for img in c["images"])
+        img_counts[kind] += len(c["images"])
+        parts.append(_td(text + imgs, kind, c["span"]))
+    return "".join(parts)
+
+
+def _paired_row_cells(old_row, new_row, img_counts):
+    """
+    Cells of a row that exists on both sides: cells are lined up by their
+    content (so an inserted column doesn't shift everything), then compared
+    word by word. Returns (cells_html, changed?).
+    """
+    def key(c):
+        return " ".join(c["text"].split()) + "\x00" + "|".join(i["hash"] for i in c["images"])
+
+    old_cells, new_cells = old_row["cells"], new_row["cells"]
+    matcher = difflib.SequenceMatcher(None, [key(c) for c in old_cells],
+                                      [key(c) for c in new_cells], autojunk=False)
+    parts, changed = [], False
+
+    def pair(old_c, new_c):
+        nonlocal changed
+        matched = match_images(old_c["images"], new_c["images"])
+        for _, status in matched:
+            img_counts[status] += 1
+        imgs = "".join(image_html(img, status) for img, status in matched)
+        same_text = old_c["text"].split() == new_c["text"].split()
+        if same_text and all(status == "same" for _, status in matched):
+            parts.append(_td(_cell_text_html(new_c["text"]) + imgs, "same", new_c["span"]))
+        else:
+            changed = True
+            text = _cell_text_html(new_c["text"]) if same_text else word_diff_html(old_c["text"], new_c["text"])
+            parts.append(_td(text + imgs, "changed", new_c["span"]))
+
+    def single(c, kind):
+        nonlocal changed
+        changed = True
+        parts.append(_single_row_cells({"cells": [c]}, kind, img_counts))
+
+    for op, i1, i2, j1, j2 in matcher.get_opcodes():
+        if op == "equal":
+            for k in range(i2 - i1):
+                pair(old_cells[i1 + k], new_cells[j1 + k])
+        elif op == "delete":
+            for c in old_cells[i1:i2]:
+                single(c, "removed")
+        elif op == "insert":
+            for c in new_cells[j1:j2]:
+                single(c, "added")
+        else:  # replace: pair up by position, the rest is removed / added
+            n = min(i2 - i1, j2 - j1)
+            for k in range(n):
+                pair(old_cells[i1 + k], new_cells[j1 + k])
+            for c in old_cells[i1 + n:i2]:
+                single(c, "removed")
+            for c in new_cells[j1 + n:j2]:
+                single(c, "added")
+    return "".join(parts), changed
+
+
 def diff_items(items1, items2):
     """
     Compare two ordered lists of paragraph items.
     Returns (rows, counts, img_counts) where rows is a list of
-    (kind, html) with kind one of same / changed / added / removed.
+    (kind, html, table) with kind one of same / changed / added / removed;
+    table is None for paragraphs, and for table rows says which table
+    ({"old": id, "new": id, "header": bool}) so rows can be drawn as a table.
     """
     texts1 = [it["text"] for it in items1]
     texts2 = [it["text"] for it in items2]
@@ -1262,14 +1694,27 @@ def diff_items(items1, items2):
 
     def add_single(it, kind):
         """A paragraph that exists on one side only (kind: 'added' or 'removed')."""
+        if "cells" in it:
+            side = "old" if kind == "removed" else "new"
+            rows.append((kind, _single_row_cells(it, kind, img_counts),
+                         {side: it["table"], "header": it["header"]}))
+            counts[kind] += 1
+            return
         text_html = f'<span class="{kind}">{html.escape(it["text"])}</span>' if it["text"] else ""
         img_html = "".join(image_html(img, kind) for img in it["images"])
         img_counts[kind] += len(it["images"])
-        rows.append((kind, text_html + img_html))
+        rows.append((kind, text_html + img_html, None))
         counts[kind] += 1
 
     def add_pair(old_it, new_it):
         """A paragraph that exists on both sides, possibly edited."""
+        if "cells" in old_it and "cells" in new_it:
+            cells_html, changed = _paired_row_cells(old_it, new_it, img_counts)
+            kind = "changed" if changed else "same"
+            rows.append((kind, cells_html, {"old": old_it["table"], "new": new_it["table"],
+                                            "header": new_it["header"]}))
+            counts[kind] += 1
+            return
         matched = match_images(old_it["images"], new_it["images"])
         for _, status in matched:
             img_counts[status] += 1
@@ -1283,7 +1728,7 @@ def diff_items(items1, items2):
         else:
             text_html = word_diff_html(old_it["text"], new_it["text"])
             kind = "changed"
-        rows.append((kind, text_html + img_html))
+        rows.append((kind, text_html + img_html, None))
         counts[kind] += 1
 
     for tag, i1, i2, j1, j2 in matcher.get_opcodes():
@@ -1309,15 +1754,28 @@ def diff_items(items1, items2):
 
 
 def _flow_tokens(items):
-    """Words and pictures of some paragraphs as one stream: (kind, key, starts_paragraph, image)."""
+    """
+    Words and pictures of some items as one stream:
+    (kind, key, starts_paragraph, image, cell) where cell is (row item,
+    cell number) for table rows and None otherwise.
+    """
     tokens = []
     for it in items:
         start = True
+        if "cells" in it:
+            for c, cell in enumerate(it["cells"]):
+                for word in cell["text"].split():
+                    tokens.append(("w", word, start, None, (it, c)))
+                    start = False
+                for img in cell["images"]:
+                    tokens.append(("i", img["hash"], start, img, (it, c)))
+                    start = False
+            continue
         for word in it["text"].split():
-            tokens.append(("w", word, start, None))
+            tokens.append(("w", word, start, None, None))
             start = False
         for img in it["images"]:
-            tokens.append(("i", img["hash"], start, img))
+            tokens.append(("i", img["hash"], start, img, None))
             start = False
     return tokens
 
@@ -1327,15 +1785,15 @@ def diff_items_flow(items1, items2):
     Like diff_items(), but ignores where paragraphs are split. Used whenever
     a PDF is involved: a PDF can break one Word paragraph into two (or join
     two), and that alone shouldn't be reported as a change. Only wording,
-    order and pictures count. Rows follow the new file's paragraphs.
+    order and pictures count. Rows follow the new file's paragraphs, and
+    table rows are drawn with the new file's cells.
     """
     rows = []
     counts = {"same": 0, "changed": 0, "added": 0, "removed": 0}
     img_counts = {"same": 0, "added": 0, "removed": 0}
 
-    def render(row):
-        statuses = {status for status, _ in row}
-        kind = statuses.pop() if len(statuses) == 1 else "changed"
+    def render_tokens(pieces):
+        """HTML for a run of (status, token) pieces; also counts pictures."""
         parts, words, words_status = [], [], None
 
         def flush_words():
@@ -1344,7 +1802,7 @@ def diff_items_flow(items1, items2):
                 parts.append(text if words_status == "same" else f'<span class="{words_status}">{text}</span>')
                 words.clear()
 
-        for status, tok in row:
+        for status, tok in pieces:
             if tok[0] == "w":
                 if status != words_status:
                     flush_words()
@@ -1358,18 +1816,73 @@ def diff_items_flow(items1, items2):
                 if status == "same" and tok[3].get("match") == "resized":
                     img_counts["check"] = img_counts.get("check", 0) + 1
         flush_words()
-        counts[kind] += 1
-        rows.append((kind, " ".join(parts)))
+        return " ".join(parts)
 
-    def emit(pieces):
-        current = []
+    def kind_of(statuses):
+        statuses = set(statuses)
+        return statuses.pop() if len(statuses) == 1 else "changed"
+
+    def render(unit, old_row_of):
+        if unit["type"] == "para":
+            kind = kind_of(s for s, _ in unit["pieces"])
+            rows.append((kind, render_tokens(unit["pieces"]), None))
+        else:
+            row = unit["row"]
+            cells_html, statuses = [], []
+            for cell, pieces in zip(row["cells"], unit["cells"]):
+                cell_statuses = [s for s, _ in pieces]
+                statuses += cell_statuses
+                status = kind_of(cell_statuses) if cell_statuses else "same"
+                cells_html.append(_td(render_tokens(pieces), status, cell["span"]))
+            kind = kind_of(statuses)
+            if unit["side"] == "old":
+                table = {"old": row["table"], "header": row["header"]}
+            else:
+                old_row = old_row_of.get(id(row))
+                # A PDF can't mark header rows; take the mark from the other file.
+                header = row["header"] or bool(old_row and old_row["header"])
+                table = {"old": old_row["table"] if old_row else None, "new": row["table"], "header": header}
+            rows.append((kind, "".join(cells_html), table))
+        counts[kind] += 1
+
+    def emit(pieces, old_to_new=None):
+        """
+        Group (status, token, starts) pieces into paragraphs and table rows.
+        Everything that belongs to one table row ends up in that row, even
+        when other changes (such as a removed row) come between its parts.
+        """
+        old_to_new = old_to_new or {}
+        old_row_of = {id(new): old for old, new in old_to_new.values()}
+        units, row_units = [], {}
+        unit = None
         for status, tok, starts in pieces:
-            if starts and current:
-                render(current)
-                current = []
-            current.append((status, tok))
-        if current:
-            render(current)
+            cell = tok[4]
+            if cell is not None:
+                row, c = cell
+                mapped = old_to_new.get(id(row)) if status == "removed" else None
+                target = mapped[1] if mapped else row
+                unit = row_units.get(id(target))
+                if unit is None:
+                    side = "old" if status == "removed" and mapped is None else "new"
+                    unit = {"type": "row", "row": target, "side": side,
+                            "cells": [[] for _ in target["cells"]], "last": 0}
+                    row_units[id(target)] = unit
+                    units.append(unit)
+                if target is not row and len(row["cells"]) != len(target["cells"]):
+                    c = unit["last"]  # old row had a different shape: keep it in place
+                unit["cells"][c].append((status, tok))
+                unit["last"] = c
+                continue
+            if unit is not None and unit["type"] == "row" and (status == "removed" or not starts):
+                # Text that was not in a table on the other side: show it in the cell it belongs to.
+                unit["cells"][unit["last"]].append((status, tok))
+                continue
+            if unit is None or unit["type"] != "para" or (starts and unit["pieces"]):
+                unit = {"type": "para", "pieces": []}
+                units.append(unit)
+            unit["pieces"].append((status, tok))
+        for u in units:
+            render(u, old_row_of)
 
     def key(it):
         return it["text"] + "\x00" + "|".join(img["hash"] for img in it["images"])
@@ -1377,26 +1890,60 @@ def diff_items_flow(items1, items2):
     matcher = difflib.SequenceMatcher(None, [key(i) for i in items1], [key(i) for i in items2], autojunk=False)
     for tag, i1, i2, j1, j2 in matcher.get_opcodes():
         if tag == "equal":
-            emit([("same", t, t[2]) for t in _flow_tokens(items2[j1:j2])])
+            old_to_new = {}
+            for old_it, new_it in zip(items1[i1:i2], items2[j1:j2]):
+                if "cells" in old_it and "cells" in new_it:
+                    old_to_new[id(old_it)] = (old_it, new_it)
+            emit([("same", t, t[2]) for t in _flow_tokens(items2[j1:j2])], old_to_new)
             continue
         old_tokens = _flow_tokens(items1[i1:i2])
         new_tokens = _flow_tokens(items2[j1:j2])
         words = difflib.SequenceMatcher(None, [t[:2] for t in old_tokens],
                                         [t[:2] for t in new_tokens], autojunk=False)
-        pieces = []
+        pieces, old_to_new = [], {}
         for op, a1, a2, b1, b2 in words.get_opcodes():
             if op == "equal":
+                for old_t, new_t in zip(old_tokens[a1:a2], new_tokens[b1:b2]):
+                    if old_t[4] is not None and new_t[4] is not None:
+                        old_to_new.setdefault(id(old_t[4][0]), (old_t[4][0], new_t[4][0]))
                 pieces += [("same", t, t[2]) for t in new_tokens[b1:b2]]
             else:
                 pieces += [("removed", t, t[2]) for t in old_tokens[a1:a2]]
                 pieces += [("added", t, t[2]) for t in new_tokens[b1:b2]]
-        emit(pieces)
+        emit(pieces, old_to_new)
 
     return rows, counts, img_counts
 
 
 def rows_html(rows):
-    return "\n".join(f'<div class="row {kind}">{content}</div>' for kind, content in rows)
+    """HTML for diff rows; consecutive rows of the same table are drawn as one table."""
+    out, group = [], []
+    last = {"old": None, "new": None}
+
+    def close_table():
+        if group:
+            out.append('<div class="table-wrap"><table class="diff-table">'
+                       + "".join(group) + "</table></div>")
+            group.clear()
+
+    for kind, content, table in rows:
+        if table is None:
+            close_table()
+            last.update(old=None, new=None)
+            out.append(f'<div class="row {kind}">{content}</div>')
+            continue
+        same_table = group and all(table.get(side) is None or last[side] is None
+                                   or table.get(side) == last[side] for side in ("old", "new"))
+        if not same_table:
+            close_table()
+            last.update(old=None, new=None)
+        header = " theader" if table.get("header") else ""
+        group.append(f'<tr class="trow {kind}{header}">{content}</tr>')
+        for side in ("old", "new"):
+            if table.get(side) is not None:
+                last[side] = table[side]
+    close_table()
+    return "\n".join(out)
 
 
 # ===========================================================================
@@ -1631,6 +2178,14 @@ PAGE_TEMPLATE = string.Template("""<!DOCTYPE html>
   .removed { background: #f8c6c6; color: #7f1d1d; text-decoration: line-through;
              padding: 1px 3px; border-radius: 3px; }
   .legend span { margin-right: 16px; }
+  .table-wrap { overflow-x: auto; margin: 6px 0; }
+  table.diff-table { border-collapse: collapse; min-width: 50%; }
+  .diff-table td { border: 1px solid #bbb; padding: 4px 8px; vertical-align: top; }
+  .diff-table tr.theader td { font-weight: bold; background: #f3f4f6; }
+  .diff-table td.cell-changed { background: #fff9e6; }
+  .diff-table td.cell-added, .diff-table tr.added td { background: #eaffea; }
+  .diff-table td.cell-removed, .diff-table tr.removed td { background: #ffecec; }
+  .diff-table .img-inline img { max-width: 180px; max-height: 180px; }
   .img-inline { display: inline-block; vertical-align: top; margin: 8px 8px 0 0;
                 border: 1px solid #ddd; border-radius: 6px; padding: 6px;
                 background: #fff; }
@@ -1768,7 +2323,7 @@ def build_report(items1, items2, name1, name2, requirement_prefix=DEFAULT_REQUIR
         rows, counts, img_counts = diff(old["items"] if old else [],
                                         new["items"] if new else [])
         tally(counts, img_counts)
-        edited_rows = sum(1 for kind, _ in rows if kind != "same")
+        edited_rows = sum(1 for row in rows if row[0] != "same")
 
         note = ""
         if old is None:
@@ -1901,6 +2456,9 @@ def _compare_files(file1, file2, output_path, requirement_prefix, name1, name2, 
                 keep = [img for img in it["images"] if image_thumbnail(img["bytes"]) is not None]
                 skipped += len(it["images"]) - len(keep)
                 it["images"] = keep
+                kept = {id(img) for img in keep}
+                for cell in it.get("cells", []):
+                    cell["images"] = [img for img in cell["images"] if id(img) in kept]
             items[:] = [it for it in items if it["text"] or it["images"]]
         if skipped:
             notes.append(

@@ -21,6 +21,18 @@ python compare_docx.py
 
 Pick the old file, the new file, where to save the report, and click Compare.
 
+## Tables
+
+Tables are shown as tables in the report, with changes marked cell by cell:
+a changed value is highlighted inside its cell, added rows and columns are
+green, removed ones red, and header rows and merged cells are kept. This
+works the same for Word, HTML and PDF files. In a PDF, tables are found from
+their drawn border lines; a table without borders is compared as ordinary
+text. A table that continues on the next PDF page is treated as one table.
+
+Tables used only for page layout (a single framing cell, or cells containing
+titles or many paragraphs) are read as ordinary paragraphs.
+
 ## Old Word files (.doc)
 
 Word 97-2003 files (`.doc`) are converted to `.docx` automatically before

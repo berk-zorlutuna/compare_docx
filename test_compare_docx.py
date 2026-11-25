@@ -68,8 +68,11 @@ def test_extract_table_and_nested_table(tmp_path):
         inner.cell(0, 0).paragraphs[0].add_run().add_picture(png("red"), width=Inches(1))
         doc.add_paragraph("After")
     items = cd.extract_items(make(tmp_path, "a.docx", build))
-    assert [i["text"] for i in items] == ["Before", "Cell A", "Nested", "After"]
-    assert len(items[2]["images"]) == 1
+    # A table row is one item; a nested table is flattened into its cell.
+    assert [i["text"] for i in items] == ["Before", "Cell A Nested", "After"]
+    row = items[1]
+    assert [(c["text"], len(c["images"])) for c in row["cells"]] == [("Cell A", 0), ("Nested", 1)]
+    assert len(row["images"]) == 1 and row["images"][0] is row["cells"][1]["images"][0]
 
 
 def test_extract_image_only_paragraph(tmp_path):
@@ -1108,7 +1111,7 @@ def test_generic_html_structure(tmp_path):
     assert html_texts(p) == [
         "#System & Requirements", "Nested bold text, spread over lines.",
         "Line one line two line three", "First item", "Second item",
-        "Parameter", "Value", "Timeout", "30 s", "After stray end tags",
+        "Parameter Value", "Timeout 30 s", "After stray end tags",
         "Unclosed paragraph", "Next paragraph"]
 
 
@@ -1252,3 +1255,240 @@ def test_html_combinations_find_the_same_changes(html_files, tmp_path, a, b):
         ("Changed", "Requirement Number 8"),
         ("New", "Requirement Number 13"),
     ]
+
+
+# ---------- tables ----------
+
+def tables_in(page):
+    """[[(row class, [cell texts])...] per <table>] from a report page."""
+    out = []
+    for table in re.findall(r'<table class="diff-table">(.*?)</table>', page, re.S):
+        rows = []
+        for cls, cells in re.findall(r'<tr class="trow ([^"]+)">(.*?)</tr>', table, re.S):
+            texts = [re.sub(r"<[^>]+>", " ", c) for c in re.findall(r"<td[^>]*>(.*?)</td>", cells, re.S)]
+            rows.append((cls, [" ".join(t.split()) for t in texts]))
+        out.append(rows)
+    return out
+
+
+def card(page, name):
+    """The HTML of one requirement/title card (the whole page for a plain report)."""
+    if '<details class="req' not in page:
+        return page
+    for block in re.findall(r'<details class="req.*?</details>', page, re.S):
+        summary = re.search(r"<summary>(.*?)</summary>", block, re.S).group(1)
+        if re.sub(r"<[^>]+>", "|", summary).rstrip("|").endswith(name):
+            return block
+    raise AssertionError(f"no card {name}")
+
+
+def signal_doc(version):
+    """A signal table with a header row; v2 adds a column and a row and removes a row."""
+    def build(doc):
+        doc.add_heading("Signal list", 1)
+        cols = ["Signal", "Type"] + (["Unit"] if version == 2 else [])
+        rows = [("Speed", "uint16", "km/h"), ("Door", "enum", "-"), ("Brake", "bool", "-")]
+        if version == 2:
+            rows = [rows[0], ("Traction", "uint8", "%"), rows[2]]
+        t = doc.add_table(rows=1, cols=len(cols))
+        t.style = "Table Grid"
+        for i, c in enumerate(cols):
+            t.rows[0].cells[i].text = c
+        t.rows[0]._tr.get_or_add_trPr().append(parse_xml(f'<w:tblHeader {nsdecls("w")}/>'))
+        for r in rows:
+            cells = t.add_row().cells
+            for i in range(len(cols)):
+                cells[i].text = r[i]
+        doc.add_paragraph("After the table.")
+    return build
+
+
+def test_docx_table_structure(tmp_path):
+    def build(doc):
+        t = doc.add_table(rows=3, cols=3)
+        t.cell(0, 0).merge(t.cell(0, 2)).text = "Merged heading"
+        t.cell(1, 0).merge(t.cell(2, 0)).text = "Tall"
+        t.cell(1, 1).text, t.cell(1, 2).text = "a", "b"
+        t.cell(2, 1).text, t.cell(2, 2).text = "c", "d"
+        t.rows[0]._tr.get_or_add_trPr().append(parse_xml(f'<w:tblHeader {nsdecls("w")}/>'))
+        p = t.cell(1, 2).add_paragraph("second paragraph")
+        p.add_run().add_picture(png("red"), width=Inches(0.5))
+    rows = cd.extract_items(make(tmp_path, "a.docx", build))
+    assert [[(c["text"], c["span"]) for c in r["cells"]] for r in rows] == [
+        [("Merged heading", 3)],
+        [("Tall", 1), ("a", 1), ("b\nsecond paragraph", 1)],
+        [("", 1), ("c", 1), ("d", 1)],          # vertically merged cell: text only once
+    ]
+    assert [r["header"] for r in rows] == [True, False, False]
+    assert len({r["table"] for r in rows}) == 1
+    assert rows[1]["text"] == "Tall a b second paragraph" and len(rows[1]["images"]) == 1
+
+
+def test_layout_tables_are_read_as_paragraphs(tmp_path):
+    def build(doc):
+        box = doc.add_table(rows=1, cols=1)
+        box.cell(0, 0).text = "A framed note."
+        frame = doc.add_table(rows=1, cols=2)
+        frame.cell(0, 0).paragraphs[0].style = doc.styles["Heading 1"]
+        frame.cell(0, 0).paragraphs[0].text = "Chapter in a frame"
+        frame.cell(0, 1).text = "Body text."
+    items = cd.extract_items(make(tmp_path, "a.docx", build))
+    assert [(i["text"], "cells" in i, i["heading"]) for i in items] == [
+        ("A framed note.", False, False), ("Chapter in a frame", False, True), ("Body text.", False, False)]
+
+
+def test_docx_table_report_draws_table_with_cell_changes(tmp_path):
+    out = str(tmp_path / "r.html")
+    s, _ = cd.run_comparison(make(tmp_path, "v1.docx", signal_doc(1)), make(tmp_path, "v2.docx", signal_doc(2)), out)
+    page = open(out, encoding="utf-8").read()
+    assert tables_in(card(page, "Signal list")) == [[
+        ("changed theader", ["Signal", "Type", "Unit"]),   # a column was added
+        ("changed", ["Speed", "uint16", "km/h"]),
+        ("removed", ["Door", "enum"]),
+        ("added", ["Traction", "uint8", "%"]),
+        ("changed", ["Brake", "bool", "-"]),
+    ]]
+    block = card(page, "Signal list")
+    assert '<td class="cell-added"><span class="added">Unit</span></td>' in block
+    assert '<td class="cell-removed"><span class="removed">Door</span></td>' in block
+    assert "After the table." in block and block.index("After the table.") > block.index("</table>")
+
+
+def test_single_cell_change_is_marked_in_its_cell(tmp_path):
+    def doc(value):
+        def build(d):
+            t = d.add_table(rows=2, cols=2)
+            t.cell(0, 0).text, t.cell(0, 1).text = "Timeout", value
+            t.cell(1, 0).text, t.cell(1, 1).text = "Retries", "3"
+        return build
+    out = str(tmp_path / "r.html")
+    cd.run_comparison(make(tmp_path, "a.docx", doc("30 s")), make(tmp_path, "b.docx", doc("45 s")), out)
+    page = open(out, encoding="utf-8").read()
+    assert tables_in(page) == [[("changed", ["Timeout", "30 45 s"]), ("same", ["Retries", "3"])]]
+    assert ('<td class="cell-same">Timeout</td><td class="cell-changed"><span class="removed">30</span> '
+            '<span class="added">45</span> s</td>') in page
+
+
+def test_html_tables(tmp_path):
+    p = write(tmp_path, "a.html", """<html><body>
+      <table><caption>Signals</caption>
+        <tr><th>Signal</th><th>Type</th></tr>
+        <tr><td>Speed<td>uint16
+        <tr><td colspan="2">Merged <table><tr><td>inner</td></tr></table></td></tr>
+      </table>
+      <table><tr><td><h2>Layout title</h2><p>Layout text</p></td></tr></table>
+      <p>After</p></body></html>""")
+    items = cd.extract_items_html(p)
+    assert [(i["text"], "cells" in i) for i in items] == [
+        ("Signals", False), ("Signal Type", True), ("Speed uint16", True), ("Merged inner", True),
+        ("Layout title", False), ("Layout text", False), ("After", False)]
+    assert items[1]["header"] and not items[2]["header"]
+    assert [(c["text"], c["span"]) for c in items[3]["cells"]] == [("Merged\ninner", 2)]
+
+
+def grid_pdf(tmp_path, name, pages, cols=(72, 200, 330), row_h=20, surrounding_text=True):
+    """A PDF with ruled tables: pages = [[row, row, ...], ...], each row a list of cell texts."""
+    doc = pymupdf.open()
+    for rows in pages:
+        page = doc.new_page(width=595, height=842)
+        if surrounding_text:
+            page.insert_text((72, 80), "Heading text above.", fontsize=11)
+        top = 100
+        x_edges = list(cols)
+        y_edges = [top + k * row_h for k in range(len(rows) + 1)]
+        for y in y_edges:
+            page.draw_line((x_edges[0], y), (x_edges[-1], y), width=0.5)
+        for r, row in enumerate(rows):
+            y0, y1 = y_edges[r], y_edges[r + 1]
+            page.draw_line((x_edges[0], y0), (x_edges[0], y1), width=0.5)
+            page.draw_line((x_edges[-1], y0), (x_edges[-1], y1), width=0.5)
+            if len(row) == len(x_edges) - 1:   # otherwise: one merged cell, no inner line
+                for x in x_edges[1:-1]:
+                    page.draw_line((x, y0), (x, y1), width=0.5)
+            for c, text in enumerate(row):
+                page.insert_text((x_edges[c] + 4, y1 - 6), text, fontsize=10)
+        if surrounding_text:
+            page.insert_text((72, y_edges[-1] + 30), "Text after the table.", fontsize=11)
+    path = str(tmp_path / name)
+    doc.save(path)
+    return path
+
+
+def test_pdf_ruled_table_is_read_as_rows(tmp_path):
+    p = grid_pdf(tmp_path, "t.pdf", [[["Signal", "Type"], ["Merged across both"], ["Speed", "uint16"]]])
+    items = cd.extract_items_pdf(p)
+    assert [(i["text"], "cells" in i) for i in items] == [
+        ("Heading text above.", False), ("Signal Type", True), ("Merged across both", True),
+        ("Speed uint16", True), ("Text after the table.", False)]
+    assert [c["span"] for c in items[2]["cells"]] == [2]
+
+
+def test_pdf_table_split_over_pages_is_one_table(tmp_path):
+    header = ["ID", "Name"]
+    # Page 1 ends with the table and page 2 starts with it, header row repeated.
+    p = grid_pdf(tmp_path, "t.pdf", [[header, ["1", "One"]], [header, ["2", "Two"]]],
+                 surrounding_text=False)
+    rows = cd.extract_items_pdf(p)
+    assert [r["text"] for r in rows] == ["ID Name", "1 One", "2 Two"]   # repeated header dropped
+    assert len({r["table"] for r in rows}) == 1
+    # With text between them, two tables stay two tables.
+    p = grid_pdf(tmp_path, "t2.pdf", [[header, ["1", "One"]], [header, ["2", "Two"]]])
+    tables = {i["table"] for i in cd.extract_items_pdf(p) if "cells" in i}
+    assert len(tables) == 2
+
+
+def test_word_table_vs_unruled_pdf_text_shows_no_change_and_a_table(tmp_path):
+    def build(doc):
+        doc.add_paragraph("Settings")
+        t = doc.add_table(rows=2, cols=2)
+        t.cell(0, 0).text, t.cell(0, 1).text = "Timeout", "30 s"
+        t.cell(1, 0).text, t.cell(1, 1).text = "Retries", "3"
+    d = make(tmp_path, "a.docx", build)
+    pdf = make_pdf(tmp_path, "a.pdf", [[("Settings", 11), ("", 0), ("Timeout", 11), ("30 s", 11, 200),
+                                        ("Retries", 11), ("3", 11, 200)]])
+    out = str(tmp_path / "r.html")
+    s, _ = cd.run_comparison(pdf, d, out)
+    page = open(out, encoding="utf-8").read()
+    assert (s["changed"], s["added"], s["removed"]) == (0, 0, 0), s
+    assert tables_in(page) == [[("same", ["Timeout", "30 s"]), ("same", ["Retries", "3"])]]
+
+
+@pytest.fixture(scope="module")
+def table_files(tmp_path_factory):
+    if not SOFFICE:
+        pytest.skip("LibreOffice not installed")
+    d = tmp_path_factory.mktemp("tables")
+    docx = [make(d, "v1.docx", signal_doc(1)), make(d, "v2.docx", signal_doc(2))]
+    pdfs = to_pdf(docx, d)
+    subprocess.run([SOFFICE, "--headless", "--convert-to", "html", "--outdir", str(d), *docx],
+                   check=True, capture_output=True, timeout=300)
+    return {"v1.docx": docx[0], "v2.docx": docx[1], "v1.pdf": pdfs[0], "v2.pdf": pdfs[1],
+            "v1.html": str(d / "v1.html"), "v2.html": str(d / "v2.html")}
+
+
+@pytest.mark.parametrize("a, b", [("v1.docx", "v1.pdf"), ("v1.pdf", "v1.docx"), ("v1.docx", "v1.html")])
+def test_table_vs_same_table_in_other_format(table_files, tmp_path, a, b):
+    out = str(tmp_path / "r.html")
+    s, _ = cd.run_comparison(table_files[a], table_files[b], out)
+    assert (s["changed"], s["added"], s["removed"]) == (0, 0, 0), s
+    page = open(out, encoding="utf-8").read()
+    assert [[cells for _, cells in t] for t in tables_in(page)] == [[
+        ["Signal", "Type"], ["Speed", "uint16"], ["Door", "enum"], ["Brake", "bool"]]]
+
+
+@pytest.mark.parametrize("a, b", [("v1.docx", "v2.docx"), ("v1.docx", "v2.pdf"), ("v1.pdf", "v2.pdf"),
+                                  ("v1.html", "v2.html"), ("v1.pdf", "v2.html"), ("v1.html", "v2.docx")])
+def test_table_changes_drawn_the_same_in_every_format(table_files, tmp_path, a, b):
+    out = str(tmp_path / "r.html")
+    cd.run_comparison(table_files[a], table_files[b], out)
+    rows = tables_in(card(open(out, encoding="utf-8").read(), "Signal list"))
+    assert len(rows) == 1, rows                      # one table, not loose lines
+    assert [(cls.split()[0], cells) for cls, cells in rows[0]] == [
+        ("changed", ["Signal", "Type", "Unit"]),
+        ("changed", ["Speed", "uint16", "km/h"]),
+        ("removed", ["Door", "enum"]),
+        ("added", ["Traction", "uint8", "%"]),
+        ("changed", ["Brake", "bool", "-"]),
+    ]
+    # The header row stays a header row -- unless both files are PDFs, which can't mark one.
+    assert ("theader" in rows[0][0][0]) == (not (a.endswith(".pdf") and b.endswith(".pdf")))
